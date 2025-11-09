@@ -1,0 +1,171 @@
+### BTC_5min.csv Data Dictionary
+
+#### 1️⃣ Time Information
+- `system_time`: Exact system time of data recording
+- `timestamp`: Rounded timestamp used for analysis (`pd.to_datetime(df['system_time']).dt.round('min')`)
+
+#### 2️⃣ Price Information
+- `midpoint`: Midpoint price between best bid and best ask
+- `spread`: Difference between best bid and best ask
+
+#### 3️⃣ Trade Activity
+- `buys`: Number of executed buy trades in this interval
+- `sells`: Number of executed sell trades in this interval
+
+#### 4️⃣ Bid Book Distances (from midpoint)
+- `bids_distance_0`: Distance of bid level 0 from the midpoint in %
+- `bids_distance_1`: Distance of bid level 1 from the midpoint in %
+- `bids_distance_2`: Distance of bid level 2 from the midpoint in %
+- `bids_distance_3`: Distance of bid level 3 from the midpoint in %
+- `bids_distance_4`: Distance of bid level 4 from the midpoint in %
+- `bids_distance_5`: Distance of bid level 5 from the midpoint in %
+- `bids_distance_6`: Distance of bid level 6 from the midpoint in %
+- `bids_distance_7`: Distance of bid level 7 from the midpoint in %
+- `bids_distance_8`: Distance of bid level 8 from the midpoint in %
+- `bids_distance_9`: Distance of bid level 9 from the midpoint in %
+- `bids_distance_10`: Distance of bid level 10 from the midpoint in %
+- `bids_distance_11`: Distance of bid level 11 from the midpoint in %
+- `bids_distance_12`: Distance of bid level 12 from the midpoint in %
+- `bids_distance_13`: Distance of bid level 13 from the midpoint in %
+- `bids_distance_14`: Distance of bid level 14 from the midpoint in %
+
+#### 5️⃣ Bid Notional Volumes
+- `bids_notional_0`: Total notional amount at bid level 0
+- `bids_notional_1`: Total notional amount at bid level 1
+- `bids_notional_2`: Total notional amount at bid level 2
+- `bids_notional_3`: Total notional amount at bid level 3
+- `bids_notional_4`: Total notional amount at bid level 4
+- `bids_notional_5`: Total notional amount at bid level 5
+- `bids_notional_6`: Total notional amount at bid level 6
+- `bids_notional_7`: Total notional amount at bid level 7
+- `bids_notional_8`: Total notional amount at bid level 8
+- `bids_notional_9`: Total notional amount at bid level 9
+- `bids_notional_10`: Total notional amount at bid level 10
+- `bids_notional_11`: Total notional amount at bid level 11
+- `bids_notional_12`: Total notional amount at bid level 12
+- `bids_notional_13`: Total notional amount at bid level 13
+- `bids_notional_14`: Total notional amount at bid level 14
+- `bids_cancel_notional_0`: Notional of cancelled orders at bid level 0
+- `bids_cancel_notional_1`: Notional of cancelled orders at bid level 1
+- `bids_cancel_notional_2`: Notional of cancelled orders at bid level 2
+- `bids_cancel_notional_3`: Notional of cancelled orders at bid level 3
+- `bids_cancel_notional_4`: Notional of cancelled orders at bid level 4
+- `bids_cancel_notional_5`: Notional of cancelled orders at bid level 5
+- `bids_cancel_notional_6`: Notional of cancelled orders at bid level 6
+- `bids_cancel_notional_7`: Notional of cancelled orders at bid level 7
+- `bids_cancel_notional_8`: Notional of cancelled orders at bid level 8
+- `bids_cancel_notional_9`: Notional of cancelled orders at bid level 9
+- `bids_cancel_notional_10`: Notional of cancelled orders at bid level 10
+- `bids_cancel_notional_11`: Notional of cancelled orders at bid level 11
+- `bids_cancel_notional_12`: Notional of cancelled orders at bid level 12
+- `bids_cancel_notional_13`: Notional of cancelled orders at bid level 13
+- `bids_cancel_notional_14`: Notional of cancelled orders at bid level 14
+- `bids_limit_notional_0`: Notional of limit orders at bid level 0
+- `bids_limit_notional_1`: Notional of limit orders at bid level 1
+- `bids_limit_notional_2`: Notional of limit orders at bid level 2
+- `bids_limit_notional_3`: Notional of limit orders at bid level 3
+- `bids_limit_notional_4`: Notional of limit orders at bid level 4
+- `bids_limit_notional_5`: Notional of limit orders at bid level 5
+- `bids_limit_notional_6`: Notional of limit orders at bid level 6
+- `bids_limit_notional_7`: Notional of limit orders at bid level 7
+- `bids_limit_notional_8`: Notional of limit orders at bid level 8
+- `bids_limit_notional_9`: Notional of limit orders at bid level 9
+- `bids_limit_notional_10`: Notional of limit orders at bid level 10
+- `bids_limit_notional_11`: Notional of limit orders at bid level 11
+- `bids_limit_notional_12`: Notional of limit orders at bid level 12
+- `bids_limit_notional_13`: Notional of limit orders at bid level 13
+- `bids_limit_notional_14`: Notional of limit orders at bid level 14
+- `bids_market_notional_0`: Notional of market orders at bid level 0
+- `bids_market_notional_1`: Notional of market orders at bid level 1
+- `bids_market_notional_2`: Notional of market orders at bid level 2
+- `bids_market_notional_3`: Notional of market orders at bid level 3
+- `bids_market_notional_4`: Notional of market orders at bid level 4
+- `bids_market_notional_5`: Notional of market orders at bid level 5
+- `bids_market_notional_6`: Notional of market orders at bid level 6
+- `bids_market_notional_7`: Notional of market orders at bid level 7
+- `bids_market_notional_8`: Notional of market orders at bid level 8
+- `bids_market_notional_9`: Notional of market orders at bid level 9
+- `bids_market_notional_10`: Notional of market orders at bid level 10
+- `bids_market_notional_11`: Notional of market orders at bid level 11
+- `bids_market_notional_12`: Notional of market orders at bid level 12
+- `bids_market_notional_13`: Notional of market orders at bid level 13
+- `bids_market_notional_14`: Notional of market orders at bid level 14
+
+#### 6️⃣ Ask Book Distances (from midpoint)
+- `asks_distance_0`: Distance of ask level 0 from the midpoint in %
+- `asks_distance_1`: Distance of ask level 1 from the midpoint in %
+- `asks_distance_2`: Distance of ask level 2 from the midpoint in %
+- `asks_distance_3`: Distance of ask level 3 from the midpoint in %
+- `asks_distance_4`: Distance of ask level 4 from the midpoint in %
+- `asks_distance_5`: Distance of ask level 5 from the midpoint in %
+- `asks_distance_6`: Distance of ask level 6 from the midpoint in %
+- `asks_distance_7`: Distance of ask level 7 from the midpoint in %
+- `asks_distance_8`: Distance of ask level 8 from the midpoint in %
+- `asks_distance_9`: Distance of ask level 9 from the midpoint in %
+- `asks_distance_10`: Distance of ask level 10 from the midpoint in %
+- `asks_distance_11`: Distance of ask level 11 from the midpoint in %
+- `asks_distance_12`: Distance of ask level 12 from the midpoint in %
+- `asks_distance_13`: Distance of ask level 13 from the midpoint in %
+- `asks_distance_14`: Distance of ask level 14 from the midpoint in %
+
+#### 7️⃣ Ask Notional Volumes
+- `asks_notional_0`: Total notional amount at ask level 0
+- `asks_notional_1`: Total notional amount at ask level 1
+- `asks_notional_2`: Total notional amount at ask level 2
+- `asks_notional_3`: Total notional amount at ask level 3
+- `asks_notional_4`: Total notional amount at ask level 4
+- `asks_notional_5`: Total notional amount at ask level 5
+- `asks_notional_6`: Total notional amount at ask level 6
+- `asks_notional_7`: Total notional amount at ask level 7
+- `asks_notional_8`: Total notional amount at ask level 8
+- `asks_notional_9`: Total notional amount at ask level 9
+- `asks_notional_10`: Total notional amount at ask level 10
+- `asks_notional_11`: Total notional amount at ask level 11
+- `asks_notional_12`: Total notional amount at ask level 12
+- `asks_notional_13`: Total notional amount at ask level 13
+- `asks_notional_14`: Total notional amount at ask level 14
+- `asks_cancel_notional_0`: Notional of cancelled orders at ask level 0
+- `asks_cancel_notional_1`: Notional of cancelled orders at ask level 1
+- `asks_cancel_notional_2`: Notional of cancelled orders at ask level 2
+- `asks_cancel_notional_3`: Notional of cancelled orders at ask level 3
+- `asks_cancel_notional_4`: Notional of cancelled orders at ask level 4
+- `asks_cancel_notional_5`: Notional of cancelled orders at ask level 5
+- `asks_cancel_notional_6`: Notional of cancelled orders at ask level 6
+- `asks_cancel_notional_7`: Notional of cancelled orders at ask level 7
+- `asks_cancel_notional_8`: Notional of cancelled orders at ask level 8
+- `asks_cancel_notional_9`: Notional of cancelled orders at ask level 9
+- `asks_cancel_notional_10`: Notional of cancelled orders at ask level 10
+- `asks_cancel_notional_11`: Notional of cancelled orders at ask level 11
+- `asks_cancel_notional_12`: Notional of cancelled orders at ask level 12
+- `asks_cancel_notional_13`: Notional of cancelled orders at ask level 13
+- `asks_cancel_notional_14`: Notional of cancelled orders at ask level 14
+- `asks_limit_notional_0`: Notional of limit orders at ask level 0
+- `asks_limit_notional_1`: Notional of limit orders at ask level 1
+- `asks_limit_notional_2`: Notional of limit orders at ask level 2
+- `asks_limit_notional_3`: Notional of limit orders at ask level 3
+- `asks_limit_notional_4`: Notional of limit orders at ask level 4
+- `asks_limit_notional_5`: Notional of limit orders at ask level 5
+- `asks_limit_notional_6`: Notional of limit orders at ask level 6
+- `asks_limit_notional_7`: Notional of limit orders at ask level 7
+- `asks_limit_notional_8`: Notional of limit orders at ask level 8
+- `asks_limit_notional_9`: Notional of limit orders at ask level 9
+- `asks_limit_notional_10`: Notional of limit orders at ask level 10
+- `asks_limit_notional_11`: Notional of limit orders at ask level 11
+- `asks_limit_notional_12`: Notional of limit orders at ask level 12
+- `asks_limit_notional_13`: Notional of limit orders at ask level 13
+- `asks_limit_notional_14`: Notional of limit orders at ask level 14
+- `asks_market_notional_0`: Notional of market orders at ask level 0
+- `asks_market_notional_1`: Notional of market orders at ask level 1
+- `asks_market_notional_2`: Notional of market orders at ask level 2
+- `asks_market_notional_3`: Notional of market orders at ask level 3
+- `asks_market_notional_4`: Notional of market orders at ask level 4
+- `asks_market_notional_5`: Notional of market orders at ask level 5
+- `asks_market_notional_6`: Notional of market orders at ask level 6
+- `asks_market_notional_7`: Notional of market orders at ask level 7
+- `asks_market_notional_8`: Notional of market orders at ask level 8
+- `asks_market_notional_9`: Notional of market orders at ask level 9
+- `asks_market_notional_10`: Notional of market orders at ask level 10
+- `asks_market_notional_11`: Notional of market orders at ask level 11
+- `asks_market_notional_12`: Notional of market orders at ask level 12
+- `asks_market_notional_13`: Notional of market orders at ask level 13
+- `asks_market_notional_14`: Notional of market orders at ask level 14
