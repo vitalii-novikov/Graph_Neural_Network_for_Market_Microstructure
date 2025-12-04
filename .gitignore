@@ -1,2 +1,4 @@
 dataset/
 archive.zip
+.ipynb_checkpoints
+EDA_notebooks/.Rhistory
