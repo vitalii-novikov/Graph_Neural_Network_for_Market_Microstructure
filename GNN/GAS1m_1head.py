@@ -1,18 +1,16 @@
-# %% [markdown]
-# # Two-stage LOB GNN (SGA-TCN) — VS Code / Jupyter compatible (.py)
-# Формат: логические шаги через `# %%`.
-# Важные принципы:
-# - Scaling только по train (time-ordered, без leakage)
-# - Stage A: trade/no-trade (AUC)
-# - Stage B: direction на trade-only (AUC на trade-only)
-# - Пороги (thr_trade, thr_dir) выбираем ТОЛЬКО на val, на holdout НЕ подбираем
+# %%
+# Two-stage LOB GNN (SGA-TCN) -> Single-head 3-class (down/flat/up)
+# VS Code / Jupyter compatible (.py) using # %% cells
 #
-# Рекомендовано для Mac M2 (CPU): batch_size=64..128, hidden=64..128, epochs=15..25, AMP отключён на CPU
-
-# %% [markdown]
-# ## Step 0 — Imports + reproducibility + config
+# Key principles:
+# - Time-ordered splits (no leakage)
+# - Scaling fit on train timeline only
+# - Single-head 3-class CE/Focal loss
+# - Thresholds (thr_trade, thr_dir) tuned ONLY on validation, then fixed on test/holdout
 
 # %%
+# Step 0 — Imports + reproducibility + config
+
 import os
 import math
 import random
@@ -28,25 +26,26 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 from sklearn.preprocessing import RobustScaler
-from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, roc_auc_score
-
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    confusion_matrix,
+    roc_auc_score,
+)
 
 def seed_everything(seed: int = 1234) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    # cuda seed safe (no-op on cpu-only)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-
 
 seed_everything(100)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("DEVICE:", DEVICE)
 
-# Для CPU на Mac часто полезно:
 torch.set_num_threads(max(1, os.cpu_count() or 4))
 
 CFG: Dict = {
@@ -75,22 +74,28 @@ CFG: Dict = {
 
     # triple-barrier
     "tb_horizon": 1 * 15,      # 15 min
-    "lookback": 5 * 12 * 5,    # 5 hours => 300
+    "lookback": 2 * 12 * 5,    # 2 hours => 120
     "tb_pt_mult": 1.2,
     "tb_sl_mult": 1.1,
     "tb_min_barrier": 0.001,
     "tb_max_barrier": 0.006,
 
     # training (CPU-friendly defaults)
-    "batch_size": 64,          # для M2 CPU обычно лучше 64..128
-    "epochs": 20,
+    "batch_size": 64,
+    "epochs": 25,
     "lr": 2e-4,
     "weight_decay": 1e-3,
     "grad_clip": 1.0,
     "dropout": 0.20,
 
+    # loss
+    "loss_name": "ce",          # "ce" or "focal"
+    "label_smoothing": 0.02,    # only used for CE
+    "focal_gamma": 2.0,         # only used for focal
+    "focal_alpha": 0.50,        # only used for focal
+
     # model
-    "hidden": 96,              # 64..128
+    "hidden": 96,
     "gnn_layers": 3,
 
     # --- SGA (spatial)
@@ -102,19 +107,19 @@ CFG: Dict = {
     "tcn_kernel": 2,
     "tcn_dropout": 0.20,
     "tcn_causal": True,
-    "tcn_pool": "last",        # "last" (causal-safe) or "mean"
+    "tcn_pool": "last",         # "last" (causal-safe) or "mean"
 
     # trading eval
     "cost_bps": 1.0,
 
     # threshold sweep grids (val only)
-    "thr_trade_grid": [0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70],
-    "thr_dir_grid":   [0.50, 0.55, 0.60, 0.65, 0.70],
+    "thr_trade_grid": [0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75],
+    "thr_dir_grid":   [0.50, 0.55, 0.60, 0.65, 0.70, 0.75],
 
-    # min trades constraints (чтобы избегать "лучше всего = 0 сделок")
+    # min trades constraints (avoid "best=0 trades")
     "eval_min_trades": 50,
 
-    # динамические квантильные пороги для thr_trade (чтобы адаптироваться к некалиброванным p_trade)
+    # dynamic quantile thresholds for thr_trade based on predicted p_trade
     "proxy_target_trades": [50, 100, 200],
 }
 
@@ -125,20 +130,17 @@ TARGET_NODE = ASSET2IDX[TARGET_ASSET]
 
 EDGE_INDEX = torch.tensor([[ASSET2IDX[s], ASSET2IDX[t]] for (s, t) in CFG["edges"]], dtype=torch.long)  # (E,2)
 
-
 def add_self_loops_edge_index(edge_index: torch.Tensor, num_nodes: int) -> torch.Tensor:
     loops = torch.arange(num_nodes, dtype=edge_index.dtype).view(-1, 1)
     loops = torch.cat([loops, loops], dim=1)
     return torch.cat([edge_index, loops], dim=0)
 
-
 EDGE_INDEX = add_self_loops_edge_index(EDGE_INDEX, num_nodes=len(ASSETS))
 print("EDGE_INDEX (with self-loops):", EDGE_INDEX.tolist())
 
-# %% [markdown]
-# ## Step 1 — Load data + log returns
-
 # %%
+# Step 1 — Load data + log returns (keep format)
+
 def load_asset(asset: str, freq: str, data_dir: Path, book_levels: int, part: Tuple[int, int] = (0, 80)) -> pd.DataFrame:
     path = data_dir / f"{asset}_{freq}.csv"
     df = pd.read_csv(path)
@@ -156,7 +158,6 @@ def load_asset(asset: str, freq: str, data_dir: Path, book_levels: int, part: Tu
         raise ValueError(f"{asset}: missing columns in CSV: {missing[:10]}{'...' if len(missing) > 10 else ''}")
 
     return df[needed]
-
 
 def load_all_assets() -> pd.DataFrame:
     freq = CFG["freq"]
@@ -182,7 +183,6 @@ def load_all_assets() -> pd.DataFrame:
     df = df_ada.join(df_btc).join(df_eth).reset_index()
     return df
 
-
 df = load_all_assets()
 for a in ASSETS:
     df[f"lr_{a}"] = np.log(df[a]).diff().fillna(0.0)
@@ -192,10 +192,9 @@ print("Columns example:", df.columns[:20].tolist())
 print("Time range:", df["timestamp"].min(), "->", df["timestamp"].max())
 print(df.head(2))
 
-# %% [markdown]
-# ## Step 2 — Multi-window correlations → edge features (T,E,W)
-
 # %%
+# Step 2 — Multi-window correlations -> edge features (T,E,W)
+
 def build_corr_array(df_: pd.DataFrame, corr_windows: List[int], edges: List[Tuple[str, str]]) -> np.ndarray:
     T_ = len(df_)
     n_edges = len(edges)
@@ -203,19 +202,26 @@ def build_corr_array(df_: pd.DataFrame, corr_windows: List[int], edges: List[Tup
 
     out = np.zeros((T_, n_edges, n_w), dtype=np.float32)
 
-    # для твоего набора edges = (ADA,BTC), (ADA,ETH), (ETH,BTC) — оставляем быстро и явно
-    # если захочешь обобщить, можно сделать циклом с rolling().corr()
-    for wi, w in enumerate(corr_windows):
-        r_ada_btc = df_["lr_ADA"].rolling(w, min_periods=1).corr(df_["lr_BTC"])
-        r_ada_eth = df_["lr_ADA"].rolling(w, min_periods=1).corr(df_["lr_ETH"])
-        r_eth_btc = df_["lr_ETH"].rolling(w, min_periods=1).corr(df_["lr_BTC"])
+    # Fast explicit version for the default 3 edges
+    # If you add edges, switch to the generic loop version below.
+    if edges == [("ADA", "BTC"), ("ADA", "ETH"), ("ETH", "BTC")]:
+        for wi, w in enumerate(corr_windows):
+            r_ada_btc = df_["lr_ADA"].rolling(w, min_periods=1).corr(df_["lr_BTC"])
+            r_ada_eth = df_["lr_ADA"].rolling(w, min_periods=1).corr(df_["lr_ETH"])
+            r_eth_btc = df_["lr_ETH"].rolling(w, min_periods=1).corr(df_["lr_BTC"])
 
-        out[:, 0, wi] = np.nan_to_num(r_ada_btc)
-        out[:, 1, wi] = np.nan_to_num(r_ada_eth)
-        out[:, 2, wi] = np.nan_to_num(r_eth_btc)
+            out[:, 0, wi] = np.nan_to_num(r_ada_btc)
+            out[:, 1, wi] = np.nan_to_num(r_ada_eth)
+            out[:, 2, wi] = np.nan_to_num(r_eth_btc)
+        return out
+
+    # Generic version for any edge list
+    for wi, w in enumerate(corr_windows):
+        for ei, (s, t) in enumerate(edges):
+            rs = df_[f"lr_{s}"].rolling(w, min_periods=1).corr(df_[f"lr_{t}"])
+            out[:, ei, wi] = np.nan_to_num(rs)
 
     return out
-
 
 corr_array = build_corr_array(df, CFG["corr_windows"], CFG["edges"])
 edge_feat = np.nan_to_num(corr_array.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
@@ -223,10 +229,9 @@ edge_feat = np.nan_to_num(corr_array.astype(np.float32), nan=0.0, posinf=0.0, ne
 print("corr_array shape:", corr_array.shape, "(T,E,W)")
 print("edge_feat sample [t=100, all edges, all windows]:\n", edge_feat[100])
 
-# %% [markdown]
-# ## Step 3 — Triple-barrier labels → two-stage labels + exit_ret
-
 # %%
+# Step 3 — Triple-barrier labels -> y_tb (0=down,1=flat,2=up) + exit_ret
+
 def triple_barrier_labels_from_lr(
     lr: pd.Series,
     horizon: int,
@@ -285,7 +290,6 @@ def triple_barrier_labels_from_lr(
 
     return y, exit_ret, exit_t, thr_np
 
-
 y_tb, exit_ret, exit_t, tb_thr = triple_barrier_labels_from_lr(
     df["lr_ETH"],
     horizon=CFG["tb_horizon"],
@@ -296,24 +300,17 @@ y_tb, exit_ret, exit_t, tb_thr = triple_barrier_labels_from_lr(
     max_barrier=CFG["tb_max_barrier"],
 )
 
-# two-stage labels
-y_trade = (y_tb != 1).astype(np.int64)   # 1=trade, 0=no-trade
-y_dir = (y_tb == 2).astype(np.int64)     # 1=up, 0=down (meaningful only when y_trade==1)
-
 dist = np.bincount(y_tb, minlength=3)
 print("TB dist [down,flat,up]:", dist)
-print("Trade ratio (true):", float(y_trade.mean()))
-
-# %% [markdown]
-# ## Step 4 — Build node tensor (T,N,F) + sample_t (valid indices in sample-space)
+print("Trade ratio (true):", float((y_tb != 1).mean()))
 
 # %%
-EPS = 1e-6
+# Step 4 — Build node tensor (T,N,F) + sample_t (valid indices in sample-space)
 
+EPS = 1e-6
 
 def safe_log1p(x: np.ndarray) -> np.ndarray:
     return np.log1p(np.maximum(x, 0.0))
-
 
 def build_node_tensor(df_: pd.DataFrame) -> Tuple[np.ndarray, List[str]]:
     """
@@ -393,7 +390,6 @@ def build_node_tensor(df_: pd.DataFrame) -> Tuple[np.ndarray, List[str]]:
     X = np.stack(feats_all, axis=1).astype(np.float32)  # (T,N,F)
     return X, feat_names
 
-
 X_node_raw, node_feat_names = build_node_tensor(df)
 T = len(df)
 L = CFG["lookback"]
@@ -407,16 +403,13 @@ n_samples = len(sample_t)
 print("X_node_raw:", X_node_raw.shape, "edge_feat:", edge_feat.shape)
 print("node_feat_names:", node_feat_names)
 print("n_samples:", n_samples, "| t range:", int(sample_t[0]), "->", int(sample_t[-1]))
-
-# quick feature sanity
 print("Feature stats (TARGET asset, lr):",
       "mean=", float(X_node_raw[:, TARGET_NODE, node_feat_names.index("lr")].mean()),
       "std=", float(X_node_raw[:, TARGET_NODE, node_feat_names.index("lr")].std()))
 
-# %% [markdown]
-# ## Step 5 — Final holdout split (time-ordered) + walk-forward splits (CV-part only)
-
 # %%
+# Step 5 — Final holdout split (time-ordered) + walk-forward splits (CV-part only)
+
 def make_final_holdout_split(n_samples_: int, final_test_frac: float) -> Tuple[np.ndarray, np.ndarray]:
     if not (0.0 < final_test_frac < 0.5):
         raise ValueError("final_test_frac should be in (0, 0.5)")
@@ -427,7 +420,6 @@ def make_final_holdout_split(n_samples_: int, final_test_frac: float) -> Tuple[n
     idx_cv = np.arange(0, n_cv, dtype=np.int64)
     idx_final = np.arange(n_cv, n_samples_, dtype=np.int64)
     return idx_cv, idx_final
-
 
 def make_walk_forward_splits(
     n_samples_: int,
@@ -459,7 +451,6 @@ def make_walk_forward_splits(
 
     return splits
 
-
 idx_cv_all, idx_final_test = make_final_holdout_split(n_samples, CFG["final_test_frac"])
 n_samples_cv = len(idx_cv_all)
 n_samples_final = len(idx_final_test)
@@ -483,25 +474,22 @@ print("\nWalk-forward folds:", len(walk_splits))
 for i, (a, b, c) in enumerate(walk_splits, 1):
     print(f"  fold {i}: train={len(a)} | val={len(b)} | test={len(c)}")
 
-# %% [markdown]
-# ## Step 6 — Dataset + scaling (train-only) + helpers
-
 # %%
-class LobGraphSequenceDataset2Stage(Dataset):
+# Step 6 — Dataset + scaling (train-only) + helpers
+
+class LobGraphSequenceDataset3C(Dataset):
     """
     Returns:
       x_seq: (L,N,F)
       e_seq: (L,E,W)
-      y_trade: scalar
-      y_dir: scalar
+      y_tb : scalar in {0,1,2} (down/flat/up)
       exit_ret: scalar
     """
     def __init__(
         self,
         X_node: np.ndarray,
         E_feat: np.ndarray,
-        y_trade_arr: np.ndarray,
-        y_dir_arr: np.ndarray,
+        y_tb_arr: np.ndarray,
         exit_ret_arr: np.ndarray,
         sample_t_: np.ndarray,
         indices: np.ndarray,
@@ -509,8 +497,7 @@ class LobGraphSequenceDataset2Stage(Dataset):
     ):
         self.X_node = X_node
         self.E_feat = E_feat
-        self.y_trade = y_trade_arr
-        self.y_dir = y_dir_arr
+        self.y_tb = y_tb_arr
         self.exit_ret = exit_ret_arr
         self.sample_t = sample_t_
         self.indices = indices.astype(np.int64)
@@ -527,29 +514,24 @@ class LobGraphSequenceDataset2Stage(Dataset):
         x_seq = self.X_node[t0:t + 1]  # (L,N,F)
         e_seq = self.E_feat[t0:t + 1]  # (L,E,W)
 
-        yt = int(self.y_trade[t])
-        yd = int(self.y_dir[t])
+        y = int(self.y_tb[t])
         er = float(self.exit_ret[t])
 
         return (
             torch.from_numpy(x_seq),
             torch.from_numpy(e_seq),
-            torch.tensor(yt, dtype=torch.long),
-            torch.tensor(yd, dtype=torch.long),
+            torch.tensor(y, dtype=torch.long),
             torch.tensor(er, dtype=torch.float32),
         )
 
-
-def collate_fn_2stage(batch):
-    xs, es, yts, yds, ers = zip(*batch)
+def collate_fn_3c(batch):
+    xs, es, ys, ers = zip(*batch)
     return (
         torch.stack(xs, 0),   # (B,L,N,F)
         torch.stack(es, 0),   # (B,L,E,W)
-        torch.stack(yts, 0),  # (B,)
-        torch.stack(yds, 0),  # (B,)
+        torch.stack(ys, 0),   # (B,)
         torch.stack(ers, 0),  # (B,)
     )
-
 
 def fit_scale_nodes_train_only(
     X_node_raw_: np.ndarray,
@@ -574,27 +556,25 @@ def fit_scale_nodes_train_only(
     X_scaled = np.nan_to_num(X_scaled, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
     return X_scaled, scaler
 
-
-def subset_trade_indices(indices: np.ndarray, sample_t_: np.ndarray, y_trade_arr: np.ndarray) -> np.ndarray:
+def split_trade_ratio_3c(indices: np.ndarray, sample_t_: np.ndarray, y_tb_arr: np.ndarray) -> float:
     tt = sample_t_[indices]
-    mask = (y_trade_arr[tt] == 1)
-    return indices[mask]
+    return float((y_tb_arr[tt] != 1).mean()) if len(tt) else float("nan")
 
-
-def split_trade_ratio(indices: np.ndarray, sample_t_: np.ndarray, y_trade_arr: np.ndarray) -> float:
+def class_distribution_3c(indices: np.ndarray, sample_t_: np.ndarray, y_tb_arr: np.ndarray) -> np.ndarray:
     tt = sample_t_[indices]
-    return float(y_trade_arr[tt].mean()) if len(tt) else float("nan")
+    y = y_tb_arr[tt].astype(np.int64)
+    return np.bincount(y, minlength=3)
 
-
-# %% [markdown]
-# ## Step 7 — Model (SGA-TCN) — drop-in logits (B,2)
+print("Sanity: example class dist on all samples:", np.bincount(y_tb[sample_t], minlength=3))
 
 # %%
+# Step 7 — Model (SGA-TCN) — single-head 3-class logits (B,3)
+
 class SpatialGraphAttentionLayer(nn.Module):
     """
     Graph Attention with edge_attr in attention scorer:
       score_e = a^T [h_src || h_dst || edge_emb]
-      attn normalized per-dst over incoming edges
+      attention normalized per-dst over incoming edges
       msg = W_msg(h_src)
       agg_dst = sum(attn * msg)
     """
@@ -634,7 +614,7 @@ class SpatialGraphAttentionLayer(nn.Module):
     def forward(self, x: torch.Tensor, edge_attr: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
         """
         x: (B,N,Fin)
-        edge_attr: (B,E_attr,W)  (может быть меньше чем E_index из-за self-loops)
+        edge_attr: (B,E_attr,W)
         edge_index: (E_index,2)
         """
         x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
@@ -655,17 +635,17 @@ class SpatialGraphAttentionLayer(nn.Module):
         src_idx = edge_index[:, 0]
         dst_idx = edge_index[:, 1]
 
-        h = self.lin_node(x).view(B, N, self.heads, self.head_dim)           # (B,N,Hh,dh)
-        eemb = self.lin_edge(edge_attr).view(B, E_index, self.heads, self.head_dim)  # (B,E,Hh,dh)
+        h = self.lin_node(x).view(B, N, self.heads, self.head_dim)                 # (B,N,Hh,dh)
+        eemb = self.lin_edge(edge_attr).view(B, E_index, self.heads, self.head_dim) # (B,E,Hh,dh)
 
         h_src = h[:, src_idx, :, :]  # (B,E,Hh,dh)
         h_dst = h[:, dst_idx, :, :]  # (B,E,Hh,dh)
 
         cat = torch.cat([h_src, h_dst, eemb], dim=-1)  # (B,E,Hh,3*dh)
-        scores = (cat * self.attn_vec[None, None, :, :]).sum(dim=-1)         # (B,E,Hh)
+        scores = (cat * self.attn_vec[None, None, :, :]).sum(dim=-1)  # (B,E,Hh)
         scores = self.act(scores)
 
-        # softmax per dst-node (N маленький => простой цикл ок)
+        # softmax per destination node
         alphas = torch.zeros_like(scores)
         for n in range(N):
             mask = (dst_idx == n)
@@ -691,7 +671,6 @@ class SpatialGraphAttentionLayer(nn.Module):
         y = self.ln(res + out)
         return torch.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
 
-
 class SpatialGraphAttentionMP(nn.Module):
     """Applies SpatialGraphAttentionLayer independently at each timestep."""
     def __init__(self, in_dim: int, hidden: int, edge_dim: int, heads: int, dropout: float):
@@ -705,7 +684,6 @@ class SpatialGraphAttentionMP(nn.Module):
         h_flat = self.gat(x_flat, e_flat, edge_index)  # (B*L,N,H)
         return h_flat.reshape(B, L_, N, -1)
 
-
 class CausalConv1d(nn.Module):
     """Causal Conv1d: pads only on the left => no future leakage."""
     def __init__(self, in_ch: int, out_ch: int, kernel_size: int, dilation: int = 1):
@@ -718,7 +696,6 @@ class CausalConv1d(nn.Module):
         pad_left = (self.kernel_size - 1) * self.dilation
         x = F.pad(x, (pad_left, 0))
         return self.conv(x)
-
 
 class TemporalBlock(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, kernel_size: int, dilation: int, dropout: float, causal: bool = True):
@@ -744,7 +721,6 @@ class TemporalBlock(nn.Module):
         res = self.downsample(x)
         return torch.nan_to_num(self.act(y + res), nan=0.0, posinf=0.0, neginf=0.0)
 
-
 class TemporalConvNet(nn.Module):
     def __init__(self, in_ch: int, channels: List[int], kernel_size: int, dropout: float, causal: bool = True):
         super().__init__()
@@ -759,15 +735,14 @@ class TemporalConvNet(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
-
-class GNN_TCN_Classifier(nn.Module):
+class GNN_TCN_Classifier3C(nn.Module):
     """
     input:
       x_seq (B,L,N,F), e_seq (B,L,E,W), edge_index (E,2)
     output:
-      logits (B,2)
+      logits (B,3) for {down, flat, up}
     """
-    def __init__(self, node_in: int, edge_dim: int, cfg: Dict, target_node: int, n_classes: int = 2):
+    def __init__(self, node_in: int, edge_dim: int, cfg: Dict, target_node: int, n_classes: int = 3):
         super().__init__()
         self.target_node = int(target_node)
 
@@ -786,8 +761,15 @@ class GNN_TCN_Classifier(nn.Module):
         self.gnns = nn.ModuleList()
         for i in range(int(cfg["gnn_layers"])):
             in_dim = int(node_in) if i == 0 else hidden
-            self.gnns.append(SpatialGraphAttentionMP(in_dim=in_dim, hidden=hidden, edge_dim=int(edge_dim),
-                                                     heads=gat_heads, dropout=dropout))
+            self.gnns.append(
+                SpatialGraphAttentionMP(
+                    in_dim=in_dim,
+                    hidden=hidden,
+                    edge_dim=int(edge_dim),
+                    heads=gat_heads,
+                    dropout=dropout,
+                )
+            )
 
         # temporal
         self.tcn_in = nn.Linear(hidden, tcn_channels)
@@ -829,9 +811,8 @@ class GNN_TCN_Classifier(nn.Module):
 
         y = self.tcn(z)                       # (B,C,L)
         emb = y[:, :, -1] if self.tcn_pool == "last" else y.mean(dim=-1)
-        logits = self.head(emb)               # (B,2)
+        logits = self.head(emb)               # (B,3)
         return torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
-
 
 # quick sanity check
 B_ = 2
@@ -840,17 +821,46 @@ E_ = EDGE_INDEX.shape[0]
 W_ = edge_feat.shape[-1]
 x_dummy = torch.randn(B_, L, len(ASSETS), Fdim)
 e_dummy = torch.randn(B_, L, E_, W_)
-m_dummy = GNN_TCN_Classifier(node_in=Fdim, edge_dim=W_, cfg=CFG, target_node=TARGET_NODE).to(DEVICE)
+m_dummy = GNN_TCN_Classifier3C(node_in=Fdim, edge_dim=W_, cfg=CFG, target_node=TARGET_NODE).to(DEVICE)
 with torch.no_grad():
     out = m_dummy(x_dummy.to(DEVICE), e_dummy.to(DEVICE), EDGE_INDEX.to(DEVICE))
 print("Model sanity logits:", out.shape, "| finite:", bool(torch.isfinite(out).all().item()))
 
-# %% [markdown]
-# ## Step 8 — Train/Eval helpers (AUC-oriented)
-
 # %%
+# Step 8 — Train/Eval helpers (3-class + derived AUCs)
+
+def make_ce_weights_3c(y_np: np.ndarray) -> torch.Tensor:
+    y_np = np.asarray(y_np, dtype=np.int64)
+    counts = np.bincount(y_np, minlength=3).astype(np.float64)
+    counts = np.maximum(counts, 1.0)
+    w = counts.sum() / (3.0 * counts)
+    return torch.tensor(w, dtype=torch.float32, device=DEVICE)
+
+class FocalLossMultiClass(nn.Module):
+    def __init__(self, weight: Optional[torch.Tensor] = None, gamma: float = 2.0, alpha: float = 0.5):
+        super().__init__()
+        self.weight = weight
+        self.gamma = float(gamma)
+        self.alpha = float(alpha)
+
+    def forward(self, logits: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        # logits: (B,C), y: (B,)
+        logp = F.log_softmax(logits, dim=-1)
+        p = torch.exp(logp)
+        y_onehot = F.one_hot(y, num_classes=logits.size(-1)).float()
+
+        pt = (p * y_onehot).sum(dim=-1).clamp_min(1e-12)
+        logpt = (logp * y_onehot).sum(dim=-1)
+
+        focal = ((1.0 - pt) ** self.gamma) * (-logpt)
+        if self.weight is not None:
+            w = self.weight[y].detach()
+            focal = focal * w
+        focal = self.alpha * focal
+        return focal.mean()
+
 @torch.no_grad()
-def eval_binary(model: nn.Module, loader: DataLoader, loss_fn: nn.Module, y_key: str) -> Dict:
+def eval_3c(model: nn.Module, loader: DataLoader, loss_fn: nn.Module) -> Dict:
     model.eval()
     total_loss = 0.0
     n = 0
@@ -859,10 +869,10 @@ def eval_binary(model: nn.Module, loader: DataLoader, loss_fn: nn.Module, y_key:
     probs = []
     ers = []
 
-    for x, e, y_trade_b, y_dir_b, er in loader:
+    for x, e, y, er in loader:
         x = x.to(DEVICE).float()
         e = e.to(DEVICE).float()
-        y = (y_trade_b if y_key == "trade" else y_dir_b).to(DEVICE).long()
+        y = y.to(DEVICE).long()
 
         logits = model(x, e, EDGE_INDEX.to(DEVICE))
         loss = loss_fn(logits, y)
@@ -876,82 +886,101 @@ def eval_binary(model: nn.Module, loader: DataLoader, loss_fn: nn.Module, y_key:
         ers.append(er.detach().cpu().numpy())
 
     ys = np.concatenate(ys) if ys else np.array([], dtype=np.int64)
-    probs = np.concatenate(probs) if probs else np.zeros((0, 2), dtype=np.float32)
+    probs = np.concatenate(probs) if probs else np.zeros((0, 3), dtype=np.float32)
     ers = np.concatenate(ers) if ers else np.array([], dtype=np.float32)
 
     if len(ys) == 0:
-        return {"loss": np.nan, "acc": np.nan, "f1m": np.nan, "auc": np.nan, "cm": None, "y": ys, "prob": probs, "er": ers}
+        return {"loss": np.nan, "acc": np.nan, "f1m": np.nan, "cm": None, "trade_auc": np.nan, "dir_auc": np.nan,
+                "y": ys, "prob": probs, "er": ers}
 
     y_pred = probs.argmax(axis=1)
     acc = accuracy_score(ys, y_pred)
     f1m = f1_score(ys, y_pred, average="macro")
-    auc = roc_auc_score(ys, probs[:, 1]) if len(np.unique(ys)) == 2 else np.nan
-    cm = confusion_matrix(ys, y_pred)
+    cm = confusion_matrix(ys, y_pred, labels=[0,1,2])
+
+    # Derived AUCs:
+    # trade_auc: (trade vs flat) where trade means {down,up}
+    y_trade = (ys != 1).astype(np.int64)
+    p_trade = (probs[:, 0] + probs[:, 2]).astype(np.float64)
+    try:
+        trade_auc = roc_auc_score(y_trade, p_trade) if len(np.unique(y_trade)) == 2 else np.nan
+    except Exception:
+        trade_auc = np.nan
+
+    # dir_auc on trade-only: up vs down using conditional prob p_up / (p_up + p_down)
+    mask_tr = (ys != 1)
+    if mask_tr.sum() >= 10 and len(np.unique(ys[mask_tr])) == 2:
+        y_dir = (ys[mask_tr] == 2).astype(np.int64)
+        p_up = probs[mask_tr, 2].astype(np.float64)
+        p_dn = probs[mask_tr, 0].astype(np.float64)
+        p_up_cond = p_up / (p_up + p_dn + 1e-12)
+        try:
+            dir_auc = roc_auc_score(y_dir, p_up_cond) if len(np.unique(y_dir)) == 2 else np.nan
+        except Exception:
+            dir_auc = np.nan
+    else:
+        dir_auc = np.nan
 
     return {
         "loss": total_loss / max(1, n),
         "acc": float(acc),
         "f1m": float(f1m),
-        "auc": float(auc) if np.isfinite(auc) else np.nan,
         "cm": cm,
+        "trade_auc": float(trade_auc) if np.isfinite(trade_auc) else np.nan,
+        "dir_auc": float(dir_auc) if np.isfinite(dir_auc) else np.nan,
         "y": ys,
         "prob": probs,
         "er": ers,
     }
 
+def build_loss_3c(cfg: Dict, class_w: torch.Tensor) -> nn.Module:
+    name = str(cfg.get("loss_name", "ce")).lower().strip()
+    if name == "focal":
+        return FocalLossMultiClass(weight=class_w, gamma=float(cfg["focal_gamma"]), alpha=float(cfg["focal_alpha"]))
+    # default CE
+    ls = float(cfg.get("label_smoothing", 0.0))
+    return nn.CrossEntropyLoss(weight=class_w, label_smoothing=ls)
 
-def make_ce_weights_binary(y_np: np.ndarray) -> torch.Tensor:
-    y_np = np.asarray(y_np, dtype=np.int64)
-    counts = np.bincount(y_np, minlength=2).astype(np.float64)
-    counts = np.maximum(counts, 1.0)
-    w = counts.sum() / (2.0 * counts)
-    return torch.tensor(w, dtype=torch.float32, device=DEVICE)
-
-
-def train_binary_classifier(
+def train_3c_classifier(
     X_scaled: np.ndarray,
     edge_feat_: np.ndarray,
-    y_trade_arr: np.ndarray,
-    y_dir_arr: np.ndarray,
+    y_tb_arr: np.ndarray,
     exit_ret_arr: np.ndarray,
     sample_t_: np.ndarray,
     idx_train: np.ndarray,
     idx_val: np.ndarray,
     idx_test: np.ndarray,
     cfg: Dict,
-    stage_name: str,  # "trade" or "dir"
 ) -> Tuple[nn.Module, Dict]:
-    assert stage_name in ("trade", "dir")
-
     L_ = int(cfg["lookback"])
     bs = int(cfg["batch_size"])
 
-    tr_ds = LobGraphSequenceDataset2Stage(X_scaled, edge_feat_, y_trade_arr, y_dir_arr, exit_ret_arr, sample_t_, idx_train, L_)
-    va_ds = LobGraphSequenceDataset2Stage(X_scaled, edge_feat_, y_trade_arr, y_dir_arr, exit_ret_arr, sample_t_, idx_val,   L_)
-    te_ds = LobGraphSequenceDataset2Stage(X_scaled, edge_feat_, y_trade_arr, y_dir_arr, exit_ret_arr, sample_t_, idx_test,  L_)
+    tr_ds = LobGraphSequenceDataset3C(X_scaled, edge_feat_, y_tb_arr, exit_ret_arr, sample_t_, idx_train, L_)
+    va_ds = LobGraphSequenceDataset3C(X_scaled, edge_feat_, y_tb_arr, exit_ret_arr, sample_t_, idx_val,   L_)
+    te_ds = LobGraphSequenceDataset3C(X_scaled, edge_feat_, y_tb_arr, exit_ret_arr, sample_t_, idx_test,  L_)
 
-    tr_loader = DataLoader(tr_ds, batch_size=bs, shuffle=True,  drop_last=False, collate_fn=collate_fn_2stage, num_workers=0)
-    va_loader = DataLoader(va_ds, batch_size=bs, shuffle=False, drop_last=False, collate_fn=collate_fn_2stage, num_workers=0)
-    te_loader = DataLoader(te_ds, batch_size=bs, shuffle=False, drop_last=False, collate_fn=collate_fn_2stage, num_workers=0)
+    tr_loader = DataLoader(tr_ds, batch_size=bs, shuffle=True,  drop_last=False, collate_fn=collate_fn_3c, num_workers=0)
+    va_loader = DataLoader(va_ds, batch_size=bs, shuffle=False, drop_last=False, collate_fn=collate_fn_3c, num_workers=0)
+    te_loader = DataLoader(te_ds, batch_size=bs, shuffle=False, drop_last=False, collate_fn=collate_fn_3c, num_workers=0)
 
     node_in = int(X_scaled.shape[-1])
     edge_dim = int(edge_feat_.shape[-1])
-    model = GNN_TCN_Classifier(node_in=node_in, edge_dim=edge_dim, cfg=cfg, target_node=TARGET_NODE).to(DEVICE)
+    model = GNN_TCN_Classifier3C(node_in=node_in, edge_dim=edge_dim, cfg=cfg, target_node=TARGET_NODE).to(DEVICE)
 
     # class weights from TRAIN only
     t_train = sample_t_[idx_train]
-    y_train_np = (y_trade_arr[t_train] if stage_name == "trade" else y_dir_arr[t_train]).astype(np.int64)
-    ce_w = make_ce_weights_binary(y_train_np)
-    loss_fn = nn.CrossEntropyLoss(weight=ce_w)
+    y_train_np = y_tb_arr[t_train].astype(np.int64)
+    class_w = make_ce_weights_3c(y_train_np)
+    loss_fn = build_loss_3c(cfg, class_w)
 
     opt = torch.optim.AdamW(model.parameters(), lr=float(cfg["lr"]), weight_decay=float(cfg["weight_decay"]))
     sch = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="max", factor=0.5, patience=3)
 
-    best_auc = -1e18
+    best_score = -1e18
     best_state = None
     best_epoch = -1
 
-    patience = 7
+    patience = 8
     bad = 0
 
     for ep in range(1, int(cfg["epochs"]) + 1):
@@ -959,15 +988,14 @@ def train_binary_classifier(
         tot_loss = 0.0
         n = 0
 
-        for x, e, y_trade_b, y_dir_b, _er in tr_loader:
+        for x, e, y, _er in tr_loader:
             x = x.to(DEVICE).float()
             e = e.to(DEVICE).float()
-            y = (y_trade_b if stage_name == "trade" else y_dir_b).to(DEVICE).long()
+            y = y.to(DEVICE).long()
 
             opt.zero_grad(set_to_none=True)
             logits = model(x, e, EDGE_INDEX.to(DEVICE))
             loss = loss_fn(logits, y)
-
             if not torch.isfinite(loss):
                 continue
 
@@ -979,26 +1007,27 @@ def train_binary_classifier(
             n += int(y.size(0))
 
         tr_loss = tot_loss / max(1, n)
+        va = eval_3c(model, va_loader, loss_fn)
 
-        va = eval_binary(model, va_loader, loss_fn, y_key=stage_name)
-        va_auc = va["auc"]
-        sel_auc = float(va_auc) if np.isfinite(va_auc) else -1e18
+        # selection metric: macro-F1 (primary) + trade_auc (secondary)
+        sel = float(va["f1m"]) + 0.10 * (float(va["trade_auc"]) if np.isfinite(va["trade_auc"]) else 0.0)
 
-        if sel_auc > best_auc:
-            best_auc = sel_auc
+        if sel > best_score:
+            best_score = sel
             best_epoch = ep
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             bad = 0
         else:
             bad += 1
 
-        sch.step(sel_auc)
-
+        sch.step(sel)
         lr_now = opt.param_groups[0]["lr"]
+
         print(
-            f"[{stage_name}] ep {ep:02d} lr={lr_now:.2e} "
-            f"tr_loss={tr_loss:.4f} va_loss={va['loss']:.4f} va_auc={va_auc:.3f} "
-            f"best={best_auc:.3f}@ep{best_epoch:02d}"
+            f"[3c] ep {ep:02d} lr={lr_now:.2e} "
+            f"tr_loss={tr_loss:.4f} va_loss={va['loss']:.4f} "
+            f"va_f1m={va['f1m']:.3f} trade_auc={va['trade_auc']:.3f} dir_auc={va['dir_auc']:.3f} "
+            f"best={best_score:.3f}@ep{best_epoch:02d}"
         )
 
         if bad >= patience:
@@ -1007,22 +1036,20 @@ def train_binary_classifier(
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    va = eval_binary(model, va_loader, loss_fn, y_key=stage_name)
-    te = eval_binary(model, te_loader, loss_fn, y_key=stage_name)
+    va = eval_3c(model, va_loader, loss_fn)
+    te = eval_3c(model, te_loader, loss_fn)
 
     res = {
         "best_epoch": int(best_epoch),
-        "best_val_auc": float(best_auc) if np.isfinite(best_auc) else np.nan,
+        "best_val_score": float(best_score) if np.isfinite(best_score) else np.nan,
         "val": va,
         "test": te,
     }
     return model, res
 
-
-# %% [markdown]
-# ## Step 9 — Two-stage PnL + threshold sweep (val only)
-
 # %%
+# Step 9 — Trading/PnL + threshold sweep (val only) using 3-class probabilities
+
 def build_trade_threshold_grid(
     p_trade: np.ndarray,
     base_grid: Optional[List[float]] = None,
@@ -1057,27 +1084,37 @@ def build_trade_threshold_grid(
             cleaned.append(float(t))
     return cleaned
 
+def trade_mask_3c(prob_3c: np.ndarray, thr_trade: float, thr_dir: float) -> np.ndarray:
+    """
+    prob_3c: (N,3) [p_down, p_flat, p_up]
+    Trade decision:
+      p_trade = 1 - p_flat
+      dir_conf = max(p_up, p_down) / (p_up + p_down)
+      trade if p_trade >= thr_trade AND dir_conf >= thr_dir
+    """
+    p_dn = prob_3c[:, 0]
+    p_fl = prob_3c[:, 1]
+    p_up = prob_3c[:, 2]
 
-def two_stage_trade_mask(prob_trade: np.ndarray, prob_dir: np.ndarray, thr_trade: float, thr_dir: float) -> np.ndarray:
-    p_trade = prob_trade[:, 1]
-    p_up = prob_dir[:, 1]
-    conf_dir = np.maximum(p_up, 1.0 - p_up)
-    return (p_trade >= float(thr_trade)) & (conf_dir >= float(thr_dir))
+    p_trade = 1.0 - p_fl
+    denom = (p_up + p_dn) + 1e-12
+    dir_conf = np.maximum(p_up, p_dn) / denom
 
+    return (p_trade >= float(thr_trade)) & (dir_conf >= float(thr_dir))
 
-def two_stage_pnl_by_threshold(
-    prob_trade: np.ndarray,
-    prob_dir: np.ndarray,
+def pnl_by_threshold_3c(
+    prob_3c: np.ndarray,
     exit_ret_arr: np.ndarray,
     thr_trade: float,
     thr_dir: float,
     cost_bps: float,
 ) -> Dict:
-    p_up = prob_dir[:, 1]
-    mask = two_stage_trade_mask(prob_trade, prob_dir, thr_trade, thr_dir)
+    p_dn = prob_3c[:, 0]
+    p_up = prob_3c[:, 2]
+    mask = trade_mask_3c(prob_3c, thr_trade, thr_dir)
 
     action = np.zeros_like(exit_ret_arr, dtype=np.float32)
-    action[mask] = np.where(p_up[mask] >= 0.5, 1.0, -1.0).astype(np.float32)
+    action[mask] = np.where(p_up[mask] >= p_dn[mask], 1.0, -1.0).astype(np.float32)
 
     cost = (float(cost_bps) * 1e-4) * mask.astype(np.float32)
     pnl = action * exit_ret_arr - cost
@@ -1092,18 +1129,16 @@ def two_stage_pnl_by_threshold(
         "pnl_sum": float(pnl.sum()),
         "pnl_mean": float(pnl.mean()) if n else np.nan,
         "pnl_per_trade": float(pnl.sum() / max(1, n_tr)),
-        "pnl_sharpe": float((pnl.mean() / (pnl.std() + 1e-12)) * np.sqrt(288)) if n else np.nan,  # per-bar proxy
+        "pnl_sharpe": float((pnl.mean() / (pnl.std() + 1e-12)) * np.sqrt(288)) if n else np.nan,
     }
 
-
-def sweep_thresholds(
-    prob_trade: np.ndarray,
-    prob_dir: np.ndarray,
+def sweep_thresholds_3c(
+    prob_3c: np.ndarray,
     exit_ret_arr: np.ndarray,
     cfg: Dict,
     min_trades: int = 0,
 ) -> pd.DataFrame:
-    p_trade = prob_trade[:, 1]
+    p_trade = (1.0 - prob_3c[:, 1]).astype(np.float64)
     thr_trade_grid = build_trade_threshold_grid(
         p_trade=p_trade,
         base_grid=cfg.get("thr_trade_grid", [0.5]),
@@ -1116,35 +1151,33 @@ def sweep_thresholds(
     rows = []
     for thr_t in thr_trade_grid:
         for thr_d in thr_dir_grid:
-            m = two_stage_pnl_by_threshold(prob_trade, prob_dir, exit_ret_arr, thr_t, thr_d, cfg["cost_bps"])
+            m = pnl_by_threshold_3c(prob_3c, exit_ret_arr, thr_t, thr_d, cfg["cost_bps"])
             if int(m["n_trades"]) < int(min_trades):
                 continue
             rows.append({"thr_trade": float(thr_t), "thr_dir": float(thr_d), **m})
 
     if not rows and min_trades > 0:
-        # soften constraint
-        return sweep_thresholds(prob_trade, prob_dir, exit_ret_arr, cfg, min_trades=1)
+        return sweep_thresholds_3c(prob_3c, exit_ret_arr, cfg, min_trades=1)
 
     if not rows:
-        # last fallback: allow 0 trades
         for thr_t in thr_trade_grid:
             for thr_d in thr_dir_grid:
-                m = two_stage_pnl_by_threshold(prob_trade, prob_dir, exit_ret_arr, thr_t, thr_d, cfg["cost_bps"])
+                m = pnl_by_threshold_3c(prob_3c, exit_ret_arr, thr_t, thr_d, cfg["cost_bps"])
                 rows.append({"thr_trade": float(thr_t), "thr_dir": float(thr_d), **m})
 
     df_ = pd.DataFrame(rows).sort_values(["pnl_sum", "pnl_mean"], ascending=False)
     return df_
 
-
 @torch.no_grad()
-def predict_probs_on_indices(model: nn.Module, X_scaled: np.ndarray, edge_feat_: np.ndarray, indices: np.ndarray, cfg: Dict) -> Tuple[np.ndarray, np.ndarray]:
-    ds = LobGraphSequenceDataset2Stage(X_scaled, edge_feat_, y_trade, y_dir, exit_ret, sample_t, indices, cfg["lookback"])
-    loader = DataLoader(ds, batch_size=int(cfg["batch_size"]), shuffle=False, collate_fn=collate_fn_2stage, num_workers=0)
+def predict_probs_on_indices_3c(model: nn.Module, X_scaled: np.ndarray, edge_feat_: np.ndarray, y_tb_arr: np.ndarray,
+                               exit_ret_arr: np.ndarray, indices: np.ndarray, cfg: Dict) -> Tuple[np.ndarray, np.ndarray]:
+    ds = LobGraphSequenceDataset3C(X_scaled, edge_feat_, y_tb_arr, exit_ret_arr, sample_t, indices, cfg["lookback"])
+    loader = DataLoader(ds, batch_size=int(cfg["batch_size"]), shuffle=False, collate_fn=collate_fn_3c, num_workers=0)
 
     model.eval()
     probs = []
     ers = []
-    for x, e, _yt, _yd, er in loader:
+    for x, e, _y, er in loader:
         x = x.to(DEVICE).float()
         e = e.to(DEVICE).float()
         logits = model(x, e, EDGE_INDEX.to(DEVICE))
@@ -1154,79 +1187,60 @@ def predict_probs_on_indices(model: nn.Module, X_scaled: np.ndarray, edge_feat_:
 
     return np.concatenate(probs, axis=0), np.concatenate(ers, axis=0)
 
-
-# %% [markdown]
-# ## Step 10 — Run walk-forward folds (CV-part): train trade → train dir → test PnL + trade share
-
 # %%
-def run_walk_forward_cv() -> pd.DataFrame:
+# Step 10 — Run walk-forward folds (CV-part): train 3-class -> choose thresholds on VAL -> test PnL
+
+def run_walk_forward_cv_3c() -> pd.DataFrame:
     rows = []
 
     for fi, (idx_tr, idx_va, idx_te) in enumerate(walk_splits, 1):
         print("\n" + "=" * 80)
         print(f"FOLD {fi}/{len(walk_splits)} sizes: train={len(idx_tr)} val={len(idx_va)} test={len(idx_te)}")
-        print(f"True trade ratio (val):  {split_trade_ratio(idx_va, sample_t, y_trade):.3f}")
-        print(f"True trade ratio (test): {split_trade_ratio(idx_te, sample_t, y_trade):.3f}")
+        print(f"True trade ratio (val):  {split_trade_ratio_3c(idx_va, sample_t, y_tb):.3f}")
+        print(f"True trade ratio (test): {split_trade_ratio_3c(idx_te, sample_t, y_tb):.3f}")
+        print("Train class dist:", class_distribution_3c(idx_tr, sample_t, y_tb).tolist())
+        print("Val   class dist:", class_distribution_3c(idx_va, sample_t, y_tb).tolist())
+        print("Test  class dist:", class_distribution_3c(idx_te, sample_t, y_tb).tolist())
 
         # scale per fold (fit only on train timeline)
         X_scaled, _scaler = fit_scale_nodes_train_only(X_node_raw, sample_t, idx_tr, max_abs=CFG["max_abs_feat"])
 
-        # Stage A
-        m_trade, r_trade = train_binary_classifier(
-            X_scaled, edge_feat, y_trade, y_dir, exit_ret, sample_t,
-            idx_tr, idx_va, idx_te, CFG, stage_name="trade"
+        # Train single-head 3-class model
+        m_3c, r_3c = train_3c_classifier(
+            X_scaled, edge_feat, y_tb, exit_ret, sample_t,
+            idx_tr, idx_va, idx_te, CFG
         )
 
-        # Stage B (train on trade-only indices)
-        idx_tr_T = subset_trade_indices(idx_tr, sample_t, y_trade)
-        idx_va_T = subset_trade_indices(idx_va, sample_t, y_trade)
-        idx_te_T = subset_trade_indices(idx_te, sample_t, y_trade)
-
-        if len(idx_tr_T) < max(200, 2 * CFG["batch_size"]) or len(idx_te_T) < 50:
-            print("[dir] skip: not enough trade samples in this fold.")
-            rows.append({
-                "fold": fi,
-                "trade_test_auc": r_trade["test"]["auc"],
-                "dir_test_auc": np.nan,
-                "test_trade_rate_pred": np.nan,
-                "test_pnl_sum": np.nan,
-                "test_pnl_mean": np.nan,
-                "thr_trade": np.nan,
-                "thr_dir": np.nan,
-                "n_trades": np.nan,
-            })
-            continue
-
-        m_dir, r_dir = train_binary_classifier(
-            X_scaled, edge_feat, y_trade, y_dir, exit_ret, sample_t,
-            idx_tr_T, idx_va_T, idx_te_T, CFG, stage_name="dir"
-        )
-
-        # Choose thresholds on VAL (важно!)
-        prob_trade_val, er_val = predict_probs_on_indices(m_trade, X_scaled, edge_feat, idx_va, CFG)
-        prob_dir_val, _ = predict_probs_on_indices(m_dir, X_scaled, edge_feat, idx_va, CFG)
-        sweep_val = sweep_thresholds(prob_trade_val, prob_dir_val, er_val, CFG, min_trades=int(CFG["eval_min_trades"]))
+        # Choose thresholds on VAL
+        prob_val, er_val = predict_probs_on_indices_3c(m_3c, X_scaled, edge_feat, y_tb, exit_ret, idx_va, CFG)
+        sweep_val = sweep_thresholds_3c(prob_val, er_val, CFG, min_trades=int(CFG["eval_min_trades"]))
         best_val = sweep_val.iloc[0].to_dict()
 
         thr_trade_star = float(best_val["thr_trade"])
         thr_dir_star = float(best_val["thr_dir"])
 
-        val_metrics = two_stage_pnl_by_threshold(prob_trade_val, prob_dir_val, er_val, thr_trade_star, thr_dir_star, CFG["cost_bps"])
+        val_metrics = pnl_by_threshold_3c(prob_val, er_val, thr_trade_star, thr_dir_star, CFG["cost_bps"])
         print("\nChosen thresholds (from VAL):")
         print(f"  thr_trade*={thr_trade_star:.3f} thr_dir*={thr_dir_star:.3f} | val trade_rate(pred)={val_metrics['trade_rate']:.3f} | val pnl_sum={val_metrics['pnl_sum']:.4f}")
 
         # Evaluate on TEST with fixed thresholds from VAL
-        prob_trade_te, er_te = predict_probs_on_indices(m_trade, X_scaled, edge_feat, idx_te, CFG)
-        prob_dir_te, _ = predict_probs_on_indices(m_dir, X_scaled, edge_feat, idx_te, CFG)
-        te_metrics = two_stage_pnl_by_threshold(prob_trade_te, prob_dir_te, er_te, thr_trade_star, thr_dir_star, CFG["cost_bps"])
+        prob_te, er_te = predict_probs_on_indices_3c(m_3c, X_scaled, edge_feat, y_tb, exit_ret, idx_te, CFG)
+        te_metrics = pnl_by_threshold_3c(prob_te, er_te, thr_trade_star, thr_dir_star, CFG["cost_bps"])
 
         print("TEST (fixed thr from VAL):")
         print(f"  trade_rate(pred)={te_metrics['trade_rate']:.3f} | pnl_sum={te_metrics['pnl_sum']:.4f} | pnl_mean={te_metrics['pnl_mean']:.6f} | trades={te_metrics['n_trades']}")
+        print("3C TEST metrics:",
+              f"acc={r_3c['test']['acc']:.3f}",
+              f"f1m={r_3c['test']['f1m']:.3f}",
+              f"trade_auc={r_3c['test']['trade_auc']:.3f}",
+              f"dir_auc={r_3c['test']['dir_auc']:.3f}")
 
         rows.append({
             "fold": fi,
-            "trade_test_auc": r_trade["test"]["auc"],
-            "dir_test_auc": r_dir["test"]["auc"],
+            "test_acc": r_3c["test"]["acc"],
+            "test_f1m": r_3c["test"]["f1m"],
+            "test_trade_auc": r_3c["test"]["trade_auc"],
+            "test_dir_auc": r_3c["test"]["dir_auc"],
             "test_trade_rate_pred": te_metrics["trade_rate"],
             "test_pnl_sum": te_metrics["pnl_sum"],
             "test_pnl_mean": te_metrics["pnl_mean"],
@@ -1237,28 +1251,20 @@ def run_walk_forward_cv() -> pd.DataFrame:
 
     return pd.DataFrame(rows)
 
-
-cv_summary = run_walk_forward_cv()
+cv_summary_3c = run_walk_forward_cv_3c()
 print("\n" + "=" * 80)
 print("CV summary (fold TEST, fixed thresholds from VAL):")
-print(cv_summary)
+print(cv_summary_3c)
 print("\nMeans:")
-print(cv_summary.mean(numeric_only=True))
-
-# %% [markdown]
-# ## Step 11 — Final train on CV(90%) and evaluate on FINAL holdout (10%)
-# Здесь печатаем:
-# - AUC по trade/dir
-# - пороги, выбранные на val_final
-# - долю трейдинга на holdout при текущих параметрах (trade_rate(pred))
-# - и oracle на holdout (только как верхняя оценка, НЕ использовать для выбора)
+print(cv_summary_3c.mean(numeric_only=True))
 
 # %%
-def run_final_train_holdout() -> None:
+# Step 11 — Final train on CV(90%) and evaluate on FINAL holdout (10%)
+
+def run_final_train_holdout_3c() -> None:
     print("\n" + "=" * 80)
     print("FINAL TRAIN/VAL on CV-part (90%) -> EVAL on FINAL holdout (10%)")
 
-    # final train/val split inside CV-part
     val_w = max(1, int(CFG["val_window_frac"] * n_samples_cv))
     train_end = n_samples_cv - val_w
 
@@ -1270,80 +1276,64 @@ def run_final_train_holdout() -> None:
     print("  train_final:", len(idx_train_final))
     print("  val_final  :", len(idx_val_final))
     print("  holdout    :", len(idx_holdout))
-    print(f"True trade ratio (val_final):  {split_trade_ratio(idx_val_final, sample_t, y_trade):.3f}")
-    print(f"True trade ratio (holdout):    {split_trade_ratio(idx_holdout, sample_t, y_trade):.3f}")
+    print(f"True trade ratio (val_final):  {split_trade_ratio_3c(idx_val_final, sample_t, y_tb):.3f}")
+    print(f"True trade ratio (holdout):    {split_trade_ratio_3c(idx_holdout, sample_t, y_tb):.3f}")
+    print("Train class dist:", class_distribution_3c(idx_train_final, sample_t, y_tb).tolist())
+    print("Val   class dist:", class_distribution_3c(idx_val_final, sample_t, y_tb).tolist())
+    print("Hold  class dist:", class_distribution_3c(idx_holdout, sample_t, y_tb).tolist())
 
     # scaling on train_final timeline only
     X_scaled_final, _ = fit_scale_nodes_train_only(X_node_raw, sample_t, idx_train_final, max_abs=CFG["max_abs_feat"])
 
-    # Stage A
-    m_trade, r_trade = train_binary_classifier(
-        X_scaled_final, edge_feat, y_trade, y_dir, exit_ret, sample_t,
-        idx_train_final, idx_val_final, idx_holdout, CFG, stage_name="trade"
-    )
-
-    # Stage B on trade-only
-    idx_train_T = subset_trade_indices(idx_train_final, sample_t, y_trade)
-    idx_val_T = subset_trade_indices(idx_val_final, sample_t, y_trade)
-    idx_hold_T = subset_trade_indices(idx_holdout, sample_t, y_trade)
-
-    print("\nTrade-only sizes for DIR:")
-    print("  train_final_T:", len(idx_train_T))
-    print("  val_final_T  :", len(idx_val_T))
-    print("  holdout_T    :", len(idx_hold_T))
-
-    m_dir, r_dir = train_binary_classifier(
-        X_scaled_final, edge_feat, y_trade, y_dir, exit_ret, sample_t,
-        idx_train_T, idx_val_T, idx_hold_T, CFG, stage_name="dir"
+    # Train 3-class model
+    m_3c, r_3c = train_3c_classifier(
+        X_scaled_final, edge_feat, y_tb, exit_ret, sample_t,
+        idx_train_final, idx_val_final, idx_holdout, CFG
     )
 
     # choose thresholds on val_final
-    prob_trade_val, er_val = predict_probs_on_indices(m_trade, X_scaled_final, edge_feat, idx_val_final, CFG)
-    prob_dir_val, _ = predict_probs_on_indices(m_dir, X_scaled_final, edge_feat, idx_val_final, CFG)
-    sweep_val = sweep_thresholds(prob_trade_val, prob_dir_val, er_val, CFG, min_trades=int(CFG["eval_min_trades"]))
+    prob_val, er_val = predict_probs_on_indices_3c(m_3c, X_scaled_final, edge_feat, y_tb, exit_ret, idx_val_final, CFG)
+    sweep_val = sweep_thresholds_3c(prob_val, er_val, CFG, min_trades=int(CFG["eval_min_trades"]))
     best_val = sweep_val.iloc[0].to_dict()
     thr_trade_star = float(best_val["thr_trade"])
     thr_dir_star = float(best_val["thr_dir"])
 
-    val_metrics = two_stage_pnl_by_threshold(prob_trade_val, prob_dir_val, er_val, thr_trade_star, thr_dir_star, CFG["cost_bps"])
-
+    val_metrics = pnl_by_threshold_3c(prob_val, er_val, thr_trade_star, thr_dir_star, CFG["cost_bps"])
     print("\nChosen thresholds on val_final:")
     print(f"  thr_trade*={thr_trade_star:.3f}")
     print(f"  thr_dir*  ={thr_dir_star:.3f}")
     print(f"  val trade_rate(pred)={val_metrics['trade_rate']:.3f} | val pnl_sum={val_metrics['pnl_sum']:.4f} | val pnl_mean={val_metrics['pnl_mean']:.6f} | trades={val_metrics['n_trades']}")
 
     # evaluate holdout with fixed thresholds from val_final
-    prob_trade_hold, er_hold = predict_probs_on_indices(m_trade, X_scaled_final, edge_feat, idx_holdout, CFG)
-    prob_dir_hold, _ = predict_probs_on_indices(m_dir, X_scaled_final, edge_feat, idx_holdout, CFG)
-    hold_metrics = two_stage_pnl_by_threshold(prob_trade_hold, prob_dir_hold, er_hold, thr_trade_star, thr_dir_star, CFG["cost_bps"])
+    prob_hold, er_hold = predict_probs_on_indices_3c(m_3c, X_scaled_final, edge_feat, y_tb, exit_ret, idx_holdout, CFG)
+    hold_metrics = pnl_by_threshold_3c(prob_hold, er_hold, thr_trade_star, thr_dir_star, CFG["cost_bps"])
 
     print("\nFINAL HOLDOUT RESULT (fixed thresholds from val_final):")
-    print(f"  trade_rate(pred)={hold_metrics['trade_rate']:.3f}  <-- доля трейдинга на holdout при текущих параметрах")
+    print(f"  trade_rate(pred)={hold_metrics['trade_rate']:.3f}")
     print(f"  pnl_sum={hold_metrics['pnl_sum']:.4f} | pnl_mean={hold_metrics['pnl_mean']:.6f} | trades={hold_metrics['n_trades']}")
     print(f"  sharpe(per-bar proxy)={hold_metrics['pnl_sharpe']:.3f}")
 
     # oracle (DO NOT USE for selection)
-    sweep_hold_oracle = sweep_thresholds(prob_trade_hold, prob_dir_hold, er_hold, CFG, min_trades=int(CFG["eval_min_trades"]))
+    sweep_hold_oracle = sweep_thresholds_3c(prob_hold, er_hold, CFG, min_trades=int(CFG["eval_min_trades"]))
     best_hold_oracle = sweep_hold_oracle.iloc[0].to_dict()
     print("\n[ORACLE] best possible on holdout by sweeping thresholds (DO NOT USE for selection):")
     print(f"  thr_trade={best_hold_oracle['thr_trade']:.3f} thr_dir={best_hold_oracle['thr_dir']:.3f}")
     print(f"  trade_rate(pred)={best_hold_oracle['trade_rate']:.3f} | pnl_sum={best_hold_oracle['pnl_sum']:.4f} | trades={int(best_hold_oracle['n_trades'])}")
 
-    # quick AUC summary
-    print("\nAUC summary:")
-    print(f"  TRADE: val_auc={r_trade['val']['auc']:.3f} | holdout_auc={r_trade['test']['auc']:.3f}")
-    print(f"  DIR  : val_auc={r_dir['val']['auc']:.3f} | holdout_auc={r_dir['test']['auc']:.3f}")
+    # quick metrics summary
+    print("\n3C metrics summary:")
+    print(f"  VAL:    acc={r_3c['val']['acc']:.3f} f1m={r_3c['val']['f1m']:.3f} trade_auc={r_3c['val']['trade_auc']:.3f} dir_auc={r_3c['val']['dir_auc']:.3f}")
+    print(f"  HOLD:   acc={r_3c['test']['acc']:.3f} f1m={r_3c['test']['f1m']:.3f} trade_auc={r_3c['test']['trade_auc']:.3f} dir_auc={r_3c['test']['dir_auc']:.3f}")
+    print("\nConfusion matrix on HOLD (rows=true, cols=pred) for [down, flat, up]:")
+    print(r_3c["test"]["cm"])
 
+run_final_train_holdout_3c()
 
-run_final_train_holdout()
-
-# %% [markdown]
-# ## Notes (коротко)
-# - “доля трейдинга на тестовом датасете при текущих параметрах” выводится как `trade_rate(pred)`:
-#   - на fold-test: “TEST (fixed thr from VAL)”
-#   - на финальном holdout: “FINAL HOLDOUT RESULT … trade_rate(pred)=…”
-#
-# Если захочешь — в следующем шаге могу:
-# 1) добавить калибровку вероятностей (temperature scaling) только по val,
-# 2) сделать альтернативный objective для threshold selection (например max pnl_sum при фикс. trade_rate),
-# 3) или сделать single-head 3-class (down/flat/up) с метрикой AUC/PR-AUC по trade и down/up отдельно.
+# %%
+# Notes
+# - This is a true single-head model: one forward pass produces probabilities for {down, flat, up}
+# - Trading decision is derived from probabilities:
+#   * trade_conf = 1 - p_flat
+#   * direction_conf = max(p_up,p_down)/(p_up+p_down)
+#   * action = sign(p_up - p_down)
+# - Thresholds are selected ONLY on the validation split, then frozen for test/holdout
