@@ -1,0 +1,24 @@
+date,Model type,freq,type,pnl_sum,val_auc_trade,val_auc_dir,test_auc_trade,test_auc_dir
+7.01.2026,MTGNN1m_2tests,1min,Post-CV check,0.21794,0.700,0.541,0.366,0.363
+4.01.2026,GAS1m_2tests,1min,Post-CV check,0.705414,0.699,0.61,0.478012,0.510843
+19.12.2025,GAT_pnl_15f2cl2s,5min,Post-CV check,0.0283,-,-,0.665,0.742
+17.12.2025,GLSTM_pnl3_15f2cl2s,5min,Post-CV check,0.1217,-,-,0.652,0.464
+17.12.2025,GNN_pnl2_15f2cl2s,5min,Post-CV check,0.0568476152,-,-,0.716,0.566
+17.12.2025,GNN_pnl_15f2cl2s,5min,Post-CV check,0.01533272228,-,-,0.664,0.669
+16.12.2025,GNN_15f2cl2stages,1min,Post-CV check,-0.05641657728,-,-,0.393,0.386
+15.12.2025,GNN_8f2cl2stages,5min,Post-CV check,0.0005918935931,-,-,0.759,0.584
+15.12.2025,GNN_6f2cl2stages,5min,Post-CV check,0.02613251911,-,-,0.747,0.561
+15.12.2025,GNN_6f_2class,5min,Post-CV check,-,0.515,0.528,-,-
+04.12.2025,ftGNN4.0,5min,Post-CV check,-,-,0.508,-,-
+04.12.2025,ftGNN2.0,5min,Post-CV check,-,-,0.512,-,-
+04.12.2025,TGNN1.0,5min,Post-CV check,-,-,0.53,-,0.5225
+04.12.2025,multi-block (A3TGCN),5min,Post-CV check,-,-,0.5494,-,0.4965
+04.12.2025,A3GCN1.1,5min,Post-CV check,-,-,0.5494,-,0.4895
+7.01.2026,MTGNN1m_2tests,1min,Full Refit check,-0.001509,0.684,0.709,0.448,0.265
+4.01.2026,GAS1m_2tests,1min,Full Refit check,-0.6364,0.678,0.594,0.481,0.512
+29.12.2025,GAS1m_1head,1min,Full Refit check,-0.2949,0.575,0.634,0.525,0.472
+28.12.2025,GAS1m_pnl_15f2cl2s,1min,Full Refit check,-1.11,-,-,0.674,0.663
+27.12.2025,GAS1m,1min,Full Refit check,-0.356,0.672,0.599,0.524,0.508
+20.12.2025,GAS_pnl_15f2cl2s,5min,Full Refit check,0.36497,-,-,0.73,0.538
+19.12.2025,GAT_pnl2_15f2cl2s,5min,Full Refit check,-0.293,-,-,0.576,0.531
+17.12.2025,GLSTM_pnl3_15f2cl2s,5min,Full Refit check,-0.053,-,-,0.559,0.48
