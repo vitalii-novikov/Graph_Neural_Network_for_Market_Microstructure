@@ -1,0 +1,129 @@
+{
+  "name": "trade",
+  "weights_file": "trade_weights.pt",
+  "node_scaler_file": "trade_node_scaler.npz",
+  "edge_scaler_file": "trade_edge_scaler.npz",
+  "cfg": {
+    "freq": "1min",
+    "data_dir": "../dataset",
+    "final_test_frac": 0.1,
+    "bundle_dir": "bundles",
+    "run_name": "mtgnn_old_wide",
+    "book_levels": 15,
+    "top_levels": 5,
+    "near_levels": 5,
+    "train_min_frac": 0.5,
+    "val_window_frac": 0.1,
+    "test_window_frac": 0.1,
+    "step_window_frac": 0.1,
+    "max_abs_feat": 10.0,
+    "max_abs_edge": 6.0,
+    "corr_windows": [
+      30,
+      60,
+      120,
+      240,
+      420
+    ],
+    "corr_lags": [
+      0,
+      1,
+      2,
+      5
+    ],
+    "edges_mode": "all_pairs",
+    "edges": [
+      [
+        "ADA",
+        "BTC"
+      ],
+      [
+        "ADA",
+        "ETH"
+      ],
+      [
+        "ETH",
+        "BTC"
+      ]
+    ],
+    "add_self_loops": true,
+    "edge_transform": "fisher",
+    "edge_scale": true,
+    "edge_dropout": 0.1,
+    "tb_horizon": 30,
+    "lookback": 240,
+    "tb_pt_mult": 1.5,
+    "tb_sl_mult": 1.5,
+    "tb_min_barrier": 0.0025,
+    "tb_max_barrier": 0.008,
+    "batch_size": 128,
+    "epochs": 20,
+    "lr": 0.0003,
+    "weight_decay": 0.0005,
+    "grad_clip": 1.0,
+    "dropout": 0.15,
+    "label_smoothing": 0.02,
+    "use_weighted_sampler": true,
+    "use_onecycle": true,
+    "hidden": 128,
+    "gnn_layers": 3,
+    "tcn_channels": 128,
+    "tcn_layers": 3,
+    "tcn_kernel": 2,
+    "tcn_dropout": 0.2,
+    "tcn_causal": true,
+    "attn_pool_hidden": 128,
+    "attn_pool_dropout": 0.1,
+    "adj_mode": "emb",
+    "adj_emb_dim": 8,
+    "adj_temperature": 1.0,
+    "prior_use_abs": false,
+    "prior_diag_boost": 1.0,
+    "prior_row_normalize": true,
+    "alpha_mode": "learned",
+    "adj_alpha": 0.5,
+    "adj_alpha_min": 0.05,
+    "adj_alpha_max": 0.95,
+    "adj_l1_lambda": 0.001,
+    "adj_prior_lambda": 0.01,
+    "cost_bps": 1.0,
+    "thr_trade_grid": [
+      0.5,
+      0.55,
+      0.6,
+      0.65,
+      0.7,
+      0.75
+    ],
+    "thr_dir_grid": [
+      0.5,
+      0.55,
+      0.6,
+      0.65,
+      0.7
+    ],
+    "eval_min_trades": 50,
+    "max_trade_rate_val": 0.65,
+    "trade_rate_penalty": 0.1,
+    "thr_objective": "pnl_sum",
+    "proxy_target_trades": [
+      50,
+      100,
+      200
+    ]
+  },
+  "seed": 100,
+  "fold": 4,
+  "assets": [
+    "ADA",
+    "BTC",
+    "ETH"
+  ],
+  "target_asset": "ETH",
+  "target_node": 2,
+  "thr_trade": 0.82420144513645,
+  "thr_dir": 0.5,
+  "best_val_score": 0.4335448905113524,
+  "val_true_trade_rate": 0.27964601769911507,
+  "stage": "trade"
+}

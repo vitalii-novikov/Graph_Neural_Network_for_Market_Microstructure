@@ -1,30 +1,48 @@
-# %%
+# %% [markdown]
 """
-Graph WaveNet / MTGNN-style model (adaptive adjacency + dilated gated TCN)
-Two-head setup: trade? -> direction? + fixed-horizon return head.
+Two-stage LOB GNN — MTGNN-style experiment
+VS Code / Jupyter compatible (.py) via #%% cells
 
-Requested changes preserved:
-1) Fixed-horizon return for regression + soft utility (TB labels remain as ground truth source).
-2) Stronger influence of utility (scaling + higher weight).
-3) Selection metric: sel = soft_utility_scaled_mean + b * dir_auc (utility emphasized).
-4) Correct lead-lag edges for 1–10 minutes.
+Key principles:
+- Train-only scaling (time-ordered, no leakage)
+- Stage A: trade / no-trade (AUC)
+- Stage B: direction on trade-only (AUC on trade-only)
+- Thresholds (thr_trade, thr_dir) are selected ONLY on val, never tuned on test/holdout
 
-Logged each epoch:
-- val_trade_auc and val_dir_auc
-- losses and soft utility
+This notebook implements:
+- Learnable adjacency (A_learned) + prior adjacency from edge_attr (A_prior)
+- Regularization:
+  (a) L1 on off-diagonal (implemented on sigmoid(adj_logits) for meaningful sparsity pressure)
+  (b) penalty for deviation from A_prior (MSE on adjacency)
+- Final adjacency:
+  A_final = alpha * A_prior + (1 - alpha) * A_learned
+  alpha is fixed or learned (clipped), controlled by CFG
+- Temporal block:
+  Conv (dilated) -> Attention pooling over time
 
-Artifacts:
-- .pt stores ONLY model weights (state_dict)
-- scalers stored as .npz (no pickle)
-- meta stored as .json
+New (per your comment):
+- We DO NOT use mean/median thresholds as the default "final check".
+- Step 10 now stores per-fold artifacts (models + thresholds + val preds).
+- Step 11 implements 3 post-CV holdout checks WITHOUT any extra refit:
+    1) LAST fold model + LAST fold thresholds
+    2) BEST-VAL fold model + BEST-VAL thresholds
+    3) LAST fold model + GLOBAL thresholds fitted on concatenated fold-VAL predictions
+- We fix the variable naming: m_trade_last / m_dir_last are explicitly saved in Step 10.
+- Step 12 is production-fit: train on CV(90%) with final val window, then evaluate on FINAL holdout(10%).
+
+ADDED (your request):
+- Save/load bundles (weights + scalers(.npz) + meta(.json)) with NO pickle.
+- Saving happens:
+  - Step 10: after each fold training (trade + dir if available)
+  - Step 12: after production-fit training (trade + dir)
 """
 
-# %%
-# ======================================================================
-# Step 0: Imports, seed, config (single unified block)
-# ======================================================================
+# %% [markdown]
+# ## Step 0 — Imports + reproducibility + config
 
+# %%
 import os
+import math
 import json
 import random
 from pathlib import Path
@@ -39,7 +57,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 
 from sklearn.preprocessing import RobustScaler
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, roc_auc_score
 
 
 def seed_everything(seed: int = 1234) -> None:
@@ -51,7 +69,9 @@ def seed_everything(seed: int = 1234) -> None:
     torch.backends.cudnn.benchmark = False
 
 
-seed_everything(100)
+# KEEP EXACT SEED (as you requested)
+SEED = 100
+seed_everything(SEED)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("DEVICE:", DEVICE)
@@ -61,8 +81,12 @@ torch.set_num_threads(max(1, os.cpu_count() or 4))
 CFG: Dict[str, Any] = {
     # data
     "freq": "1min",
-    "data_dir": "../dataset",
+    "data_dir": Path("../dataset"),
     "final_test_frac": 0.10,
+
+    # artifacts (NEW)
+    "bundle_dir": Path("./bundles"),
+    "run_name": "mtgnn_lob_2stage",
 
     # order book
     "book_levels": 15,
@@ -81,24 +105,21 @@ CFG: Dict[str, Any] = {
 
     # correlations / graph
     "corr_windows": [6 * 5, 12 * 5, 24 * 5, 48 * 5, 84 * 5],  # 30m,1h,2h,4h,7h
-    "corr_lags": list(range(0, 11)),  # lead-lag horizons: 0..10 minutes
-    "edges_mode": "all_pairs",        # "manual" | "all_pairs"
+    "corr_lags": [0, 1, 2, 5],  # lead-lag (no leakage)
+    "edges_mode": "all_pairs",  # "manual" | "all_pairs"
     "edges": [("ADA", "BTC"), ("ADA", "ETH"), ("ETH", "BTC")],  # used if edges_mode="manual"
     "add_self_loops": True,
-    "edge_transform": "fisher",       # "none" | "fisher"
+    "edge_transform": "fisher",  # "none" | "fisher"
     "edge_scale": True,
+    "edge_dropout": 0.10,
 
-    # triple-barrier labels (source of ground truth)
+    # triple-barrier
     "tb_horizon": 1 * 30,
     "lookback": 4 * 12 * 5,
     "tb_pt_mult": 1.2,
     "tb_sl_mult": 1.1,
     "tb_min_barrier": 0.001,
     "tb_max_barrier": 0.006,
-
-    # fixed-horizon return for regression + utility
-    "fixed_horizon": 30,              # minutes: r_H(t) = sum lr_{t+1..t+H}
-    "fixed_ret_clip": 0.02,           # clip future return for ret/utility stability
 
     # training
     "batch_size": 128,
@@ -109,31 +130,46 @@ CFG: Dict[str, Any] = {
     "dropout": 0.15,
 
     # stability tricks
+    "label_smoothing": 0.02,
     "use_weighted_sampler": True,
     "use_onecycle": True,
 
-    # model channels
-    "gwn_residual_channels": 64,
-    "gwn_dilation_channels": 64,
-    "gwn_skip_channels": 128,
-    "gwn_end_channels": 128,
-    "gwn_blocks": 3,
-    "gwn_layers_per_block": 2,
-    "gwn_kernel_size": 2,
+    # model dims
+    "hidden": 128,
+    "gnn_layers": 3,
 
-    # adaptive adjacency
+    # --- Temporal (Conv -> AttnPool)
+    "tcn_channels": 128,
+    "tcn_layers": 3,
+    "tcn_kernel": 2,
+    "tcn_dropout": 0.20,
+    "tcn_causal": True,
+
+    "attn_pool_hidden": 128,
+    "attn_pool_dropout": 0.10,
+
+    # --- Learnable adjacency (MTGNN-style)
+    # A_learned options:
+    #   "emb": A = softmax((E1 @ E2^T)/temp)
+    #   "matrix": A = softmax(A_logits/temp)
+    "adj_mode": "emb",
     "adj_emb_dim": 8,
     "adj_temperature": 1.0,
-    "adaptive_topk": 3,
+
+    # A_prior from edge_attr (last timestep of the sequence)
+    "prior_use_abs": False,       # if True: use abs(mean(edge_attr)) for weights
+    "prior_diag_boost": 1.0,      # ensure diag >= this before row-normalization
+    "prior_row_normalize": True,
+
+    # mixing alpha
+    "alpha_mode": "learned",      # "fixed" | "learned"
+    "adj_alpha": 0.50,            # used if alpha_mode="fixed"
+    "adj_alpha_min": 0.05,        # clamp if learned
+    "adj_alpha_max": 0.95,
 
     # adjacency regularization
     "adj_l1_lambda": 1e-3,
     "adj_prior_lambda": 1e-2,
-
-    # prior adjacency from edge_attr (last timestep)
-    "prior_use_abs": False,
-    "prior_diag_boost": 1.0,
-    "prior_row_normalize": True,
 
     # trading eval
     "cost_bps": 1.0,
@@ -141,31 +177,17 @@ CFG: Dict[str, Any] = {
     # threshold sweep grids (val only)
     "thr_trade_grid": [0.50, 0.55, 0.60, 0.65, 0.70, 0.75],
     "thr_dir_grid":   [0.50, 0.55, 0.60, 0.65, 0.70],
+
+    # min trades constraints
     "eval_min_trades": 50,
+
+    # anti-overtrading threshold selection
     "max_trade_rate_val": 0.65,
     "trade_rate_penalty": 0.10,
-    "thr_objective": "pnl_sum",
+    "thr_objective": "pnl_sum",  # "pnl_sum" | "pnl_sharpe" | "pnl_per_trade"
+
+    # dynamic quantile thresholds for thr_trade
     "proxy_target_trades": [50, 100, 200],
-
-    # selection metric: sel = soft_utility_scaled_mean + b * dir_auc
-    "sel_b_dir_auc": 0.10,
-
-    # optional anti-overtrading penalty on mean p_trade
-    "trade_prob_penalty": 0.01,
-
-    # loss weights (stronger utility)
-    "loss_w_trade": 1.0,              # BCE trade
-    "loss_w_dir": 1.0,                # BCE direction (only on true trades)
-    "loss_w_ret": 0.50,               # Huber fixed-horizon
-    "loss_w_utility": 1.00,           # utility weight increased
-
-    # regression / utility stability
-    "ret_huber_delta": 0.01,
-    "utility_k": 2.0,
-    "utility_scale": 50.0,
-
-    # artifact saving
-    "artifact_dir": "./artifacts_gwnet_twohead_fixedH",
 }
 
 ASSETS = ["ADA", "BTC", "ETH"]
@@ -173,16 +195,6 @@ ASSET2IDX = {a: i for i, a in enumerate(ASSETS)}
 TARGET_ASSET = "ETH"
 TARGET_NODE = ASSET2IDX[TARGET_ASSET]
 
-ART_DIR = Path(CFG["artifact_dir"])
-ART_DIR.mkdir(parents=True, exist_ok=True)
-
-print("Assets:", ASSETS, "| Target:", TARGET_ASSET)
-print("Artifacts dir:", str(ART_DIR.resolve()))
-
-# %%
-# ======================================================================
-# Step 0.1: Graph edges
-# ======================================================================
 
 def build_edge_list(cfg: Dict[str, Any], assets: List[str]) -> List[Tuple[str, str]]:
     mode = str(cfg.get("edges_mode", "manual"))
@@ -199,17 +211,263 @@ def build_edge_list(cfg: Dict[str, Any], assets: List[str]) -> List[Tuple[str, s
 
 
 EDGE_LIST = build_edge_list(CFG, ASSETS)
-EDGE_NAMES = [f"{s}->{t}" for (s, t) in EDGE_LIST]
+EDGE_NAMES = [f"{s}->{t}" for s, t in EDGE_LIST]
 EDGE_INDEX = torch.tensor([[ASSET2IDX[s], ASSET2IDX[t]] for (s, t) in EDGE_LIST], dtype=torch.long)
 
 print("EDGE_LIST:", EDGE_NAMES)
 print("EDGE_INDEX:", EDGE_INDEX.tolist())
 
-# %%
-# ======================================================================
-# Step 1: Data loading
-# ======================================================================
 
+# %% [markdown]
+# ## Step 0b — Bundle save/load utilities (NEW)
+
+# %%
+def _to_jsonable_cfg(x: Any) -> Any:
+    """Make CFG JSON-safe (Path -> str, numpy scalars -> python, tensors -> lists, etc.)."""
+    if isinstance(x, Path):
+        return str(x)
+    if isinstance(x, (np.integer, np.int64, np.int32)):
+        return int(x)
+    if isinstance(x, (np.floating, np.float64, np.float32)):
+        return float(x)
+    if isinstance(x, (np.ndarray,)):
+        return x.tolist()
+    if isinstance(x, (torch.Tensor,)):
+        return x.detach().cpu().tolist()
+    if isinstance(x, dict):
+        return {str(k): _to_jsonable_cfg(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [_to_jsonable_cfg(v) for v in x]
+    return x
+
+
+def save_scaler_npz(path: Path, params: Dict[str, Any]) -> None:
+    """
+    Save dict to NPZ without pickle. Values stored as arrays/scalars.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    arrays: Dict[str, np.ndarray] = {}
+    for k, v in params.items():
+        if v is None:
+            arrays[str(k)] = np.array([], dtype=np.float32)
+            arrays[str(k) + "__is_none"] = np.array([1], dtype=np.int8)
+            continue
+
+        if isinstance(v, (bool, np.bool_)):
+            arrays[str(k)] = np.array([int(bool(v))], dtype=np.int8)
+        elif isinstance(v, (int, np.integer)):
+            arrays[str(k)] = np.array([int(v)], dtype=np.int64)
+        elif isinstance(v, (float, np.floating)):
+            arrays[str(k)] = np.array([float(v)], dtype=np.float32)
+        elif isinstance(v, (str,)):
+            arrays[str(k)] = np.array([v], dtype=np.str_)
+        else:
+            arr = np.asarray(v)
+            if arr.dtype.kind in ("U", "S", "O"):
+                # convert object -> string representation (still no pickle)
+                arr = arr.astype(np.str_)
+            arrays[str(k)] = arr
+
+    np.savez_compressed(str(path), **arrays)
+
+
+def load_scaler_npz(path: Path) -> Dict[str, Any]:
+    path = Path(path)
+    with np.load(str(path), allow_pickle=False) as z:
+        out: Dict[str, Any] = {}
+        keys = list(z.keys())
+        for k in keys:
+            if k.endswith("__is_none"):
+                continue
+            arr = z[k]
+            is_none_key = k + "__is_none"
+            if is_none_key in z and int(np.asarray(z[is_none_key]).reshape(-1)[0]) == 1:
+                out[k] = None
+                continue
+
+            if arr.dtype.kind in ("U", "S"):
+                out[k] = str(arr.reshape(-1)[0]) if arr.size == 1 else arr.astype(str)
+            else:
+                if arr.size == 1:
+                    v = arr.reshape(-1)[0]
+                    if arr.dtype.kind in ("i", "u"):
+                        out[k] = int(v)
+                    elif arr.dtype.kind == "f":
+                        out[k] = float(v)
+                    else:
+                        out[k] = v
+                else:
+                    out[k] = np.asarray(arr)
+        return out
+
+
+def robust_scaler_to_params(s: RobustScaler) -> Dict[str, Any]:
+    """
+    Extract RobustScaler fit parameters (no pickle).
+    Enough to reconstruct transform.
+    """
+    params: Dict[str, Any] = {
+        "type": "RobustScaler",
+        "with_centering": bool(getattr(s, "with_centering", True)),
+        "with_scaling": bool(getattr(s, "with_scaling", True)),
+        "quantile_range": np.array(list(getattr(s, "quantile_range", (25.0, 75.0))), dtype=np.float32),
+        "unit_variance": bool(getattr(s, "unit_variance", False)),
+        "n_features_in_": int(getattr(s, "n_features_in_", -1)),
+        "center_": None,
+        "scale_": None,
+    }
+    if hasattr(s, "center_"):
+        params["center_"] = np.asarray(s.center_, dtype=np.float32) if s.center_ is not None else None
+    if hasattr(s, "scale_"):
+        params["scale_"] = np.asarray(s.scale_, dtype=np.float32) if s.scale_ is not None else None
+    if hasattr(s, "n_samples_seen_"):
+        try:
+            params["n_samples_seen_"] = int(s.n_samples_seen_)
+        except Exception:
+            pass
+    return params
+
+
+def robust_scaler_from_params(p: Dict[str, Any]) -> RobustScaler:
+    """
+    Recreate a RobustScaler instance usable for transform().
+    """
+    q = p.get("quantile_range", (25.0, 75.0))
+    if isinstance(q, np.ndarray):
+        q = tuple(float(x) for x in q.reshape(-1).tolist())
+    elif isinstance(q, (list, tuple)):
+        q = tuple(float(x) for x in q)
+
+    s = RobustScaler(
+        with_centering=bool(p.get("with_centering", True)),
+        with_scaling=bool(p.get("with_scaling", True)),
+        quantile_range=q,
+        unit_variance=bool(p.get("unit_variance", False)),
+    )
+    # set fitted attrs
+    if p.get("center_", None) is not None:
+        s.center_ = np.asarray(p["center_"], dtype=np.float64)
+    else:
+        s.center_ = None
+    if p.get("scale_", None) is not None:
+        s.scale_ = np.asarray(p["scale_"], dtype=np.float64)
+    else:
+        s.scale_ = None
+    if int(p.get("n_features_in_", -1)) > 0:
+        s.n_features_in_ = int(p["n_features_in_"])
+    if "n_samples_seen_" in p:
+        try:
+            s.n_samples_seen_ = int(p["n_samples_seen_"])
+        except Exception:
+            pass
+    return s
+
+
+def apply_robust_scaler_params(X: np.ndarray, p: Dict[str, Any], max_abs: float) -> np.ndarray:
+    """
+    Apply saved RobustScaler params without refitting. Works for any shape (..., F).
+    """
+    X = np.asarray(X, dtype=np.float32)
+    orig_shape = X.shape
+    Fdim = orig_shape[-1]
+    X2 = X.reshape(-1, Fdim).astype(np.float32)
+
+    center = p.get("center_", None)
+    scale = p.get("scale_", None)
+
+    if center is not None:
+        c = np.asarray(center, dtype=np.float32).reshape(1, -1)
+        X2 = X2 - c
+    if scale is not None:
+        sc = np.asarray(scale, dtype=np.float32).reshape(1, -1)
+        sc = np.where(np.abs(sc) < 1e-12, 1.0, sc)
+        X2 = X2 / sc
+
+    X2 = np.clip(X2, -float(max_abs), float(max_abs)).astype(np.float32)
+    X2 = np.nan_to_num(X2, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    return X2.reshape(orig_shape)
+
+
+def save_bundle(
+    bundle_dir: Path,
+    name: str,
+    model_state: Dict[str, torch.Tensor],
+    cfg: Dict[str, Any],
+    node_scaler_params: Dict[str, Any],
+    edge_scaler_params: Optional[Dict[str, Any]],
+    extra_meta: Dict[str, Any],
+) -> Dict[str, Path]:
+    bundle_dir = Path(bundle_dir)
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    weights_path = bundle_dir / f"{name}_weights.pt"
+    node_scaler_path = bundle_dir / f"{name}_node_scaler.npz"
+    edge_scaler_path = bundle_dir / f"{name}_edge_scaler.npz"
+    meta_path = bundle_dir / f"{name}_meta.json"
+
+    torch.save(model_state, str(weights_path))
+
+    save_scaler_npz(node_scaler_path, node_scaler_params)
+    edge_scaler_file = None
+    if edge_scaler_params is not None:
+        save_scaler_npz(edge_scaler_path, edge_scaler_params)
+        edge_scaler_file = edge_scaler_path.name
+
+    meta = {
+        "name": name,
+        "weights_file": weights_path.name,
+        "node_scaler_file": node_scaler_path.name,
+        "edge_scaler_file": edge_scaler_file,
+        "cfg": _to_jsonable_cfg(cfg),
+        **extra_meta,
+    }
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+
+    return {
+        "weights": weights_path,
+        "node_scaler": node_scaler_path,
+        "edge_scaler": edge_scaler_path if edge_scaler_params is not None else None,
+        "meta": meta_path,
+    }
+
+
+def load_bundle(bundle_dir: Path, name: str) -> Dict[str, Any]:
+    bundle_dir = Path(bundle_dir)
+    meta_path = bundle_dir / f"{name}_meta.json"
+    if not meta_path.exists():
+        raise FileNotFoundError(str(meta_path))
+
+    with open(meta_path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+
+    weights_path = bundle_dir / meta["weights_file"]
+    node_scaler_path = bundle_dir / meta["node_scaler_file"]
+    edge_scaler_file = meta.get("edge_scaler_file", None)
+    edge_scaler_path = (bundle_dir / edge_scaler_file) if edge_scaler_file else None
+
+    # keep user's weights_only=True, but be robust across torch versions
+    try:
+        state = torch.load(str(weights_path), map_location="cpu", weights_only=True)
+    except TypeError:
+        state = torch.load(str(weights_path), map_location="cpu")
+
+    node_scaler_params = load_scaler_npz(node_scaler_path)
+    edge_scaler_params = load_scaler_npz(edge_scaler_path) if edge_scaler_path else None
+
+    return {
+        "meta": meta,
+        "state": state,
+        "node_scaler_params": node_scaler_params,
+        "edge_scaler_params": edge_scaler_params,
+    }
+
+
+# %% [markdown]
+# ## Step 1 — Load data + log returns
+
+# %%
 def load_asset(asset: str, freq: str, data_dir: Path, book_levels: int, part: Tuple[int, int] = (0, 80)) -> pd.DataFrame:
     path = data_dir / f"{asset}_{freq}.csv"
     df = pd.read_csv(path)
@@ -231,7 +489,7 @@ def load_asset(asset: str, freq: str, data_dir: Path, book_levels: int, part: Tu
 
 def load_all_assets() -> pd.DataFrame:
     freq = CFG["freq"]
-    data_dir = Path(CFG["data_dir"])
+    data_dir = CFG["data_dir"]
     book_levels = CFG["book_levels"]
 
     def rename_cols(df_one: pd.DataFrame, asset: str) -> pd.DataFrame:
@@ -259,14 +517,15 @@ for a in ASSETS:
     df[f"lr_{a}"] = np.log(df[a]).diff().fillna(0.0)
 
 print("Loaded df:", df.shape)
+print("Columns example:", df.columns[:20].tolist())
 print("Time range:", df["timestamp"].min(), "->", df["timestamp"].max())
 print(df.head(2))
 
-# %%
-# ======================================================================
-# Step 2: Edge features (rolling corr with lead-lag 0..10 minutes)
-# ======================================================================
 
+# %% [markdown]
+# ## Step 2 — Multi-window correlations → edge features (T,E,D)
+
+# %%
 def _fisher_z(x: np.ndarray, eps: float = 1e-6) -> np.ndarray:
     x = np.clip(x, -0.999, 0.999)
     return 0.5 * np.log((1.0 + x + eps) / (1.0 - x + eps))
@@ -306,6 +565,7 @@ def build_corr_array(
         feat_idx = 0
         for lag in lags:
             src = src0.shift(int(lag)) if int(lag) > 0 else src0
+
             for w in corr_windows:
                 r = src.rolling(int(w), min_periods=1).corr(dst0)
                 r = np.nan_to_num(r.to_numpy(dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
@@ -326,16 +586,16 @@ edge_feat = build_corr_array(
 )
 
 print("edge_feat shape:", edge_feat.shape, "(T,E,edge_dim)")
-print("edge_dim =", edge_feat.shape[-1])
+print("edge_dim =", edge_feat.shape[-1], " = windows * lags =", len(CFG["corr_windows"]) * len(CFG["corr_lags"]))
+print("Edge names:", EDGE_NAMES)
+print("edge_feat sample [t=100, first 3 edges]:\n", edge_feat[100, :3, :])
+print("edge_feat stats: mean=", float(edge_feat.mean()), "std=", float(edge_feat.std()))
+
+
+# %% [markdown]
+# ## Step 3 — Triple-barrier labels → two-stage labels + exit_ret
 
 # %%
-# ======================================================================
-# Step 3: Labels (TB for trade/dir) + fixed-horizon return
-# ======================================================================
-
-EPS = 1e-6
-
-
 def triple_barrier_labels_from_lr(
     lr: pd.Series,
     horizon: int,
@@ -350,7 +610,8 @@ def triple_barrier_labels_from_lr(
       y_tb: {0=down, 1=flat/no-trade, 2=up}
       exit_ret: realized log-return to exit (tp/sl/timeout)
       exit_t: exit index
-      thr: barrier per t
+      thr: barrier per t (float array, len T)
+    No leakage: vol is shift(1).
     """
     lr = lr.astype(float).copy()
     T = len(lr)
@@ -394,45 +655,31 @@ def triple_barrier_labels_from_lr(
     return y, exit_ret, exit_t, thr_np
 
 
-def fixed_horizon_future_return(lr: np.ndarray, H: int) -> np.ndarray:
-    """
-    r_H(t) = sum_{i=1..H} lr[t+i]
-    For last H timesteps, return 0.0 (not used by sampling).
-    """
-    lr = np.asarray(lr, dtype=np.float64)
-    T = lr.shape[0]
-    out = np.zeros(T, dtype=np.float32)
-    if H <= 0:
-        return out
-    for t in range(0, T - H - 1):
-        out[t] = float(lr[t + 1: t + H + 1].sum())
-    return out
-
-
 y_tb, exit_ret, exit_t, tb_thr = triple_barrier_labels_from_lr(
     df["lr_ETH"],
-    horizon=int(CFG["tb_horizon"]),
-    vol_window=int(CFG["lookback"]),
-    pt_mult=float(CFG["tb_pt_mult"]),
-    sl_mult=float(CFG["tb_sl_mult"]),
-    min_barrier=float(CFG["tb_min_barrier"]),
-    max_barrier=float(CFG["tb_max_barrier"]),
+    horizon=CFG["tb_horizon"],
+    vol_window=CFG["lookback"],
+    pt_mult=CFG["tb_pt_mult"],
+    sl_mult=CFG["tb_sl_mult"],
+    min_barrier=CFG["tb_min_barrier"],
+    max_barrier=CFG["tb_max_barrier"],
 )
 
-y_trade = (y_tb != 1).astype(np.int64)                 # 1 if trade (SHORT or LONG)
-y_dir = (y_tb == 2).astype(np.int64)                   # 1 if LONG, 0 if SHORT (meaningful only when y_trade=1)
-
-fixed_ret = fixed_horizon_future_return(df["lr_ETH"].to_numpy(dtype=np.float64), int(CFG["fixed_horizon"]))
+# two-stage labels
+y_trade = (y_tb != 1).astype(np.int64)  # 1=trade, 0=no-trade
+y_dir = (y_tb == 2).astype(np.int64)    # 1=up, 0=down (meaningful only when y_trade==1)
 
 dist = np.bincount(y_tb, minlength=3)
 print("TB dist [down,flat,up]:", dist)
-print("True trade ratio:", float(y_trade.mean()))
-print("fixed_ret stats: mean=", float(np.mean(fixed_ret)), "std=", float(np.std(fixed_ret)))
+print("Trade ratio (true):", float(y_trade.mean()))
+
+
+# %% [markdown]
+# ## Step 4 — Build node tensor (T,N,F) + sample_t
 
 # %%
-# ======================================================================
-# Step 4: Node features
-# ======================================================================
+EPS = 1e-6
+
 
 def safe_log1p(x: np.ndarray) -> np.ndarray:
     return np.log1p(np.maximum(x, 0.0))
@@ -448,9 +695,9 @@ def build_node_tensor(df_: pd.DataFrame) -> Tuple[np.ndarray, List[str]]:
       near_ratio_bid, near_ratio_ask,
       di_near, di_far
     """
-    book_levels = int(CFG["book_levels"])
-    top_k = int(CFG["top_levels"])
-    near_k = int(CFG["near_levels"])
+    book_levels = CFG["book_levels"]
+    top_k = CFG["top_levels"]
+    near_k = CFG["near_levels"]
 
     if near_k >= book_levels:
         raise ValueError("CFG['near_levels'] must be < CFG['book_levels']")
@@ -489,7 +736,7 @@ def build_node_tensor(df_: pd.DataFrame) -> Tuple[np.ndarray, List[str]]:
             b = bids_lvls[:, i]
             s = asks_lvls[:, i]
             di_levels.append(((b - s) / (b + s + EPS)).astype(np.float32))
-        di_l0_4 = np.stack(di_levels, axis=1)
+        di_l0_4 = np.stack(di_levels, axis=1)  # (T,5)
 
         bid_near = bids_lvls[:, :near_k].sum(axis=1)
         ask_near = asks_lvls[:, :near_k].sum(axis=1)
@@ -518,25 +765,29 @@ def build_node_tensor(df_: pd.DataFrame) -> Tuple[np.ndarray, List[str]]:
 
 
 X_node_raw, node_feat_names = build_node_tensor(df)
-
 T = len(df)
-L = int(CFG["lookback"])
-H_tb = int(CFG["tb_horizon"])
-H_fixed = int(CFG["fixed_horizon"])
+L = CFG["lookback"]
+H = CFG["tb_horizon"]
 
 t_min = L - 1
-t_max = T - max(H_tb, H_fixed) - 2
+t_max = T - H - 2
 sample_t = np.arange(t_min, t_max + 1)
 n_samples = len(sample_t)
 
 print("X_node_raw:", X_node_raw.shape, "edge_feat:", edge_feat.shape)
+print("node_feat_names:", node_feat_names)
 print("n_samples:", n_samples, "| t range:", int(sample_t[0]), "->", int(sample_t[-1]))
+print(
+    "Feature stats (TARGET asset, lr):",
+    "mean=", float(X_node_raw[:, TARGET_NODE, node_feat_names.index("lr")].mean()),
+    "std=", float(X_node_raw[:, TARGET_NODE, node_feat_names.index("lr")].std()),
+)
+
+
+# %% [markdown]
+# ## Step 5 — Final holdout split + walk-forward splits (CV-part only)
 
 # %%
-# ======================================================================
-# Step 5: Splits
-# ======================================================================
-
 def make_final_holdout_split(n_samples_: int, final_test_frac: float) -> Tuple[np.ndarray, np.ndarray]:
     if not (0.0 < final_test_frac < 0.5):
         raise ValueError("final_test_frac should be in (0, 0.5)")
@@ -580,40 +831,42 @@ def make_walk_forward_splits(
     return splits
 
 
-idx_cv_all, idx_final_test = make_final_holdout_split(n_samples, float(CFG["final_test_frac"]))
+idx_cv_all, idx_final_test = make_final_holdout_split(n_samples, CFG["final_test_frac"])
 n_samples_cv = len(idx_cv_all)
-
-walk_splits = make_walk_forward_splits(
-    n_samples_=n_samples_cv,
-    train_min_frac=float(CFG["train_min_frac"]),
-    val_window_frac=float(CFG["val_window_frac"]),
-    test_window_frac=float(CFG["test_window_frac"]),
-    step_window_frac=float(CFG["step_window_frac"]),
-)
+n_samples_final = len(idx_final_test)
 
 print("Holdout split:")
 print(f"  n_samples total: {n_samples}")
-print(f"  n_samples CV   : {len(idx_cv_all)}")
-print(f"  n_samples FINAL: {len(idx_final_test)}")
+print(f"  n_samples CV   : {n_samples_cv} ({100 * n_samples_cv / n_samples:.1f}%)")
+print(f"  n_samples FINAL: {n_samples_final} ({100 * n_samples_final / n_samples:.1f}%)")
+print("  CV range   :", int(idx_cv_all[0]), int(idx_cv_all[-1]))
+print("  FINAL range:", int(idx_final_test[0]), int(idx_final_test[-1]))
+
+walk_splits = make_walk_forward_splits(
+    n_samples_=n_samples_cv,
+    train_min_frac=CFG["train_min_frac"],
+    val_window_frac=CFG["val_window_frac"],
+    test_window_frac=CFG["test_window_frac"],
+    step_window_frac=CFG["step_window_frac"],
+)
+
 print("\nWalk-forward folds:", len(walk_splits))
 for i, (a, b, c) in enumerate(walk_splits, 1):
     print(f"  fold {i}: train={len(a)} | val={len(b)} | test={len(c)}")
 
-# %%
-# ======================================================================
-# Step 6: Dataset, scaling helpers, sampler
-# ======================================================================
 
-class LobGraphSequenceDatasetTwoHeadFixedH(Dataset):
+# %% [markdown]
+# ## Step 6 — Dataset + scaling (train-only) + helpers
+
+# %%
+class LobGraphSequenceDataset2Stage(Dataset):
     """
     Returns:
-      x_seq:      (L,N,F)
-      e_seq:      (L,E,D)
-      y_trade:    scalar in {0,1}
-      y_dir:      scalar in {0,1} (meaningful only when y_trade=1)
-      exit_ret:   scalar (TB realized return to exit) - for threshold sweep / PnL eval
-      fixed_ret:  scalar (fixed-horizon future return) - for regression + utility
-      sidx:       scalar sample index
+      x_seq: (L,N,F)
+      e_seq: (L,E,edge_dim)
+      y_trade: scalar
+      y_dir: scalar
+      exit_ret: scalar
     """
     def __init__(
         self,
@@ -622,7 +875,6 @@ class LobGraphSequenceDatasetTwoHeadFixedH(Dataset):
         y_trade_arr: np.ndarray,
         y_dir_arr: np.ndarray,
         exit_ret_arr: np.ndarray,
-        fixed_ret_arr: np.ndarray,
         sample_t_: np.ndarray,
         indices: np.ndarray,
         lookback: int,
@@ -632,7 +884,6 @@ class LobGraphSequenceDatasetTwoHeadFixedH(Dataset):
         self.y_trade = y_trade_arr
         self.y_dir = y_dir_arr
         self.exit_ret = exit_ret_arr
-        self.fixed_ret = fixed_ret_arr
         self.sample_t = sample_t_
         self.indices = indices.astype(np.int64)
         self.L = int(lookback)
@@ -645,56 +896,43 @@ class LobGraphSequenceDatasetTwoHeadFixedH(Dataset):
         t = int(self.sample_t[sidx])
         t0 = t - self.L + 1
 
-        x_seq = self.X_node[t0:t + 1]
-        e_seq = self.E_feat[t0:t + 1]
+        x_seq = self.X_node[t0:t + 1]  # (L,N,F)
+        e_seq = self.E_feat[t0:t + 1]  # (L,E,D)
 
         yt = int(self.y_trade[t])
         yd = int(self.y_dir[t])
-
-        er_exit = float(self.exit_ret[t])
-        er_fixed = float(self.fixed_ret[t])
+        er = float(self.exit_ret[t])
 
         return (
             torch.from_numpy(x_seq),
             torch.from_numpy(e_seq),
-            torch.tensor(yt, dtype=torch.float32),
-            torch.tensor(yd, dtype=torch.float32),
-            torch.tensor(er_exit, dtype=torch.float32),
-            torch.tensor(er_fixed, dtype=torch.float32),
-            torch.tensor(sidx, dtype=torch.long),
+            torch.tensor(yt, dtype=torch.long),
+            torch.tensor(yd, dtype=torch.long),
+            torch.tensor(er, dtype=torch.float32),
         )
 
 
-def collate_fn_twohead(batch):
-    xs, es, ytr, ydir, er_exit, er_fixed, sidxs = zip(*batch)
+def collate_fn_2stage(batch):
+    xs, es, yts, yds, ers = zip(*batch)
     return (
-        torch.stack(xs, 0),
-        torch.stack(es, 0),
-        torch.stack(ytr, 0),
-        torch.stack(ydir, 0),
-        torch.stack(er_exit, 0),
-        torch.stack(er_fixed, 0),
-        torch.stack(sidxs, 0),
+        torch.stack(xs, 0),   # (B,L,N,F)
+        torch.stack(es, 0),   # (B,L,E,D)
+        torch.stack(yts, 0),  # (B,)
+        torch.stack(yds, 0),  # (B,)
+        torch.stack(ers, 0),  # (B,)
     )
 
 
-def make_weighted_sampler_trade(y_trade_np: np.ndarray) -> WeightedRandomSampler:
-    """
-    Weighted sampler for binary trade label.
-    """
-    y = np.asarray(y_trade_np, dtype=np.int64)
-    counts = np.bincount(y, minlength=2).astype(np.float64)
-    counts = np.maximum(counts, 1.0)
-    w = counts.sum() / (2.0 * counts)
-    sample_w = w[y].astype(np.float64)
-    return WeightedRandomSampler(torch.tensor(sample_w, dtype=torch.double), num_samples=len(sample_w), replacement=True)
-
-
-def fit_scale_nodes_train_only(X_node_raw_: np.ndarray, sample_t_: np.ndarray, idx_train: np.ndarray, max_abs: float) -> Tuple[np.ndarray, Dict[str, Any]]:
+def fit_scale_nodes_train_only(
+    X_node_raw_: np.ndarray,
+    sample_t_: np.ndarray,
+    idx_train: np.ndarray,
+    max_abs: float = 10.0
+) -> Tuple[np.ndarray, RobustScaler]:
     last_train_t = int(sample_t_[int(idx_train[-1])])
     train_time_mask = np.arange(0, last_train_t + 1)
 
-    X_train_time = X_node_raw_[train_time_mask]
+    X_train_time = X_node_raw_[train_time_mask]  # (Ttr,N,F)
     _, _, Fdim = X_train_time.shape
 
     scaler = RobustScaler(with_centering=True, with_scaling=True, quantile_range=(5.0, 95.0))
@@ -703,16 +941,23 @@ def fit_scale_nodes_train_only(X_node_raw_: np.ndarray, sample_t_: np.ndarray, i
     X_scaled = scaler.transform(X_node_raw_.reshape(-1, Fdim)).reshape(X_node_raw_.shape).astype(np.float32)
     X_scaled = np.clip(X_scaled, -max_abs, max_abs).astype(np.float32)
     X_scaled = np.nan_to_num(X_scaled, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
-
-    params = {"center_": scaler.center_.astype(np.float32), "scale_": scaler.scale_.astype(np.float32), "max_abs": float(max_abs)}
-    return X_scaled, params
+    return X_scaled, scaler
 
 
-def fit_scale_edges_train_only(E_raw_: np.ndarray, sample_t_: np.ndarray, idx_train: np.ndarray, max_abs: float) -> Tuple[np.ndarray, Dict[str, Any]]:
+def fit_scale_edges_train_only(
+    E_raw_: np.ndarray,
+    sample_t_: np.ndarray,
+    idx_train: np.ndarray,
+    max_abs: float = 6.0
+) -> Tuple[np.ndarray, RobustScaler]:
+    """
+    Robust-scale edge features per fold (train timeline only).
+    Fisher-transformed correlations can be heavy-tailed.
+    """
     last_train_t = int(sample_t_[int(idx_train[-1])])
     train_time_mask = np.arange(0, last_train_t + 1)
 
-    E_train_time = E_raw_[train_time_mask]
+    E_train_time = E_raw_[train_time_mask]  # (Ttr,E,D)
     _, _, D = E_train_time.shape
 
     scaler = RobustScaler(with_centering=True, with_scaling=True, quantile_range=(5.0, 95.0))
@@ -721,53 +966,46 @@ def fit_scale_edges_train_only(E_raw_: np.ndarray, sample_t_: np.ndarray, idx_tr
     E_scaled = scaler.transform(E_raw_.reshape(-1, D)).reshape(E_raw_.shape).astype(np.float32)
     E_scaled = np.clip(E_scaled, -max_abs, max_abs).astype(np.float32)
     E_scaled = np.nan_to_num(E_scaled, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
-
-    params = {"center_": scaler.center_.astype(np.float32), "scale_": scaler.scale_.astype(np.float32), "max_abs": float(max_abs)}
-    return E_scaled, params
+    return E_scaled, scaler
 
 
-def apply_scaler_params(X: np.ndarray, params: Dict[str, Any]) -> np.ndarray:
-    center = np.asarray(params["center_"], dtype=np.float32)
-    scale = np.asarray(params["scale_"], dtype=np.float32)
-    max_abs = float(params["max_abs"])
-    X2 = (X - center) / (scale + 1e-12)
-    X2 = np.clip(X2, -max_abs, max_abs)
-    return np.nan_to_num(X2, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+def subset_trade_indices(indices: np.ndarray, sample_t_: np.ndarray, y_trade_arr: np.ndarray) -> np.ndarray:
+    tt = sample_t_[indices]
+    mask = (y_trade_arr[tt] == 1)
+    return indices[mask]
 
 
 def split_trade_ratio(indices: np.ndarray, sample_t_: np.ndarray, y_trade_arr: np.ndarray) -> float:
     tt = sample_t_[indices]
     return float(y_trade_arr[tt].mean()) if len(tt) else float("nan")
 
+
+# %% [markdown]
+# ## Step 7 — MTGNN-style model: (Conv -> AttnPool) + learnable adjacency
+
 # %%
-# ======================================================================
-# Step 7: Graph WaveNet model (trade logit + dir logit + fixed_ret_hat)
-# ======================================================================
-
-def build_static_adjacency_from_edges(edge_index: torch.Tensor, n_nodes: int, eps: float = 1e-8) -> torch.Tensor:
-    A = torch.zeros((n_nodes, n_nodes), dtype=torch.float32)
-    src = edge_index[:, 0].long()
-    dst = edge_index[:, 1].long()
-    A[src, dst] = 1.0
-    A = A / (A.sum(dim=-1, keepdim=True) + eps)
-    return A
-
-
 def build_adj_prior_from_edge_attr(
-    edge_attr_last: torch.Tensor,
-    edge_index: torch.Tensor,
+    edge_attr_last: torch.Tensor,    # (B,E,D)
+    edge_index: torch.Tensor,        # (E,2) [src,dst]
     n_nodes: int,
-    use_abs: bool,
-    diag_boost: float,
-    row_normalize: bool,
-    eps: float = 1e-8,
+    use_abs: bool = False,
+    diag_boost: float = 1.0,
+    row_normalize: bool = True,
+    eps: float = 1e-8
 ) -> torch.Tensor:
+    """
+    Build A_prior (B,N,N) from edge_attr at the last timestep.
+    Default mapping:
+      w = sigmoid(mean(edge_attr)) in [0,1]
+    Then fill A_prior[src,dst] = w, enforce diag >= diag_boost, row-normalize.
+    """
     edge_attr_last = torch.nan_to_num(edge_attr_last, nan=0.0, posinf=0.0, neginf=0.0)
     B, E, D = edge_attr_last.shape
-    r = edge_attr_last.mean(dim=-1)
+    r = edge_attr_last.mean(dim=-1)  # (B,E)
     if use_abs:
         r = r.abs()
-    w = torch.sigmoid(r)
+
+    w = torch.sigmoid(r)  # (B,E) in [0,1]
 
     A = torch.zeros((B, n_nodes, n_nodes), device=edge_attr_last.device, dtype=edge_attr_last.dtype)
     src = edge_index[:, 0].to(edge_attr_last.device)
@@ -783,301 +1021,584 @@ def build_adj_prior_from_edge_attr(
     return torch.nan_to_num(A, nan=0.0, posinf=0.0, neginf=0.0)
 
 
-class AdaptiveAdjacency(nn.Module):
+class LearnableAdjacency(nn.Module):
+    """
+    Produces A_learned (N,N) as row-softmax over logits.
+    Also returns a "sparsity proxy" matrix for L1 regularization (sigmoid(logits)).
+    """
     def __init__(self, n_nodes: int, cfg: Dict[str, Any]):
         super().__init__()
         self.n = int(n_nodes)
-        k = int(cfg.get("adj_emb_dim", 8))
-        self.E1 = nn.Parameter(0.01 * torch.randn(self.n, k))
-        self.E2 = nn.Parameter(0.01 * torch.randn(self.n, k))
-        temp = float(cfg.get("adj_temperature", 1.0))
-        self.temp = max(temp, 1e-3)
-        self.topk = int(cfg.get("adaptive_topk", self.n))
+        self.mode = str(cfg.get("adj_mode", "emb"))
+        self.temp = float(cfg.get("adj_temperature", 1.0))
+        self.temp = max(self.temp, 1e-3)
 
-    def forward(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        logits = (self.E1 @ self.E2.t())
-        logits = F.relu(logits) / self.temp
+        if self.mode == "matrix":
+            self.adj_logits = nn.Parameter(0.01 * torch.randn(self.n, self.n))
+        elif self.mode == "emb":
+            k = int(cfg.get("adj_emb_dim", 8))
+            self.E1 = nn.Parameter(0.01 * torch.randn(self.n, k))
+            self.E2 = nn.Parameter(0.01 * torch.randn(self.n, k))
+        else:
+            raise ValueError(f"Unknown adj_mode={self.mode}")
 
-        if 0 < self.topk < self.n:
-            vals, idx = torch.topk(logits, k=self.topk, dim=-1)
-            mask = torch.full_like(logits, fill_value=float("-inf"))
-            mask.scatter_(-1, idx, vals)
-            logits = mask
+        alpha_mode = str(cfg.get("alpha_mode", "fixed"))
+        self.alpha_mode = alpha_mode
+        if self.alpha_mode == "learned":
+            init_alpha = float(cfg.get("adj_alpha", 0.5))
+            init_alpha = float(np.clip(init_alpha, 1e-3, 1 - 1e-3))
+            self.alpha_logit = nn.Parameter(torch.tensor(math.log(init_alpha / (1 - init_alpha)), dtype=torch.float32))
+        else:
+            self.register_buffer("alpha_fixed", torch.tensor(float(cfg.get("adj_alpha", 0.5)), dtype=torch.float32))
 
-        A = torch.softmax(logits, dim=-1)
-        sparsity_proxy = torch.sigmoid(logits)
-        return A, sparsity_proxy, logits
+        self.alpha_min = float(cfg.get("adj_alpha_min", 0.05))
+        self.alpha_max = float(cfg.get("adj_alpha_max", 0.95))
+
+    def _get_logits(self) -> torch.Tensor:
+        if self.mode == "matrix":
+            return self.adj_logits
+        logits = self.E1 @ self.E2.t()  # (N,N)
+        return logits
+
+    def alpha(self) -> torch.Tensor:
+        if self.alpha_mode == "learned":
+            a = torch.sigmoid(self.alpha_logit)
+            return torch.clamp(a, min=self.alpha_min, max=self.alpha_max)
+        return torch.clamp(self.alpha_fixed, min=0.0, max=1.0)
+
+    def forward(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        logits = self._get_logits() / self.temp  # (N,N)
+        A = torch.softmax(logits, dim=-1)        # row-stochastic
+        sparsity_proxy = torch.sigmoid(logits)   # used for L1 on off-diagonal
+        return A, sparsity_proxy
 
 
-class LearnableSupportMix(nn.Module):
-    def __init__(self, n_supports: int = 3):
+class GraphMixLayer(nn.Module):
+    """
+    Simple adjacency-based message passing:
+      m_j = sum_i A[i,j] * h_i
+      out = GELU(W_self h + W_nei m)
+      gated residual
+    """
+    def __init__(self, hidden: int, dropout: float):
         super().__init__()
-        self.w_logits = nn.Parameter(torch.zeros(n_supports, dtype=torch.float32))
+        self.lin_self = nn.Linear(hidden, hidden)
+        self.lin_nei = nn.Linear(hidden, hidden)
+        self.gate = nn.Linear(2 * hidden, hidden)
+        self.ln = nn.LayerNorm(hidden)
+        self.drop = nn.Dropout(dropout)
 
-    def forward(self) -> torch.Tensor:
-        return torch.softmax(self.w_logits, dim=0)
+        for m in [self.lin_self, self.lin_nei, self.gate]:
+            nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+
+    def forward(self, h: torch.Tensor, A: torch.Tensor) -> torch.Tensor:
+        """
+        h: (B,L,N,H)
+        A: (B,N,N) with A[src,dst]
+        """
+        h = torch.nan_to_num(h, nan=0.0, posinf=0.0, neginf=0.0)
+        A = torch.nan_to_num(A, nan=0.0, posinf=0.0, neginf=0.0)
+
+        m = torch.einsum("bij,blih->bljh", A, h)  # aggregate to dst=j
+        out = F.gelu(self.lin_self(h) + self.lin_nei(m))
+        out = self.drop(out)
+
+        g = torch.sigmoid(self.gate(torch.cat([h, m], dim=-1)))
+        y = g * out + (1.0 - g) * h
+        return torch.nan_to_num(self.ln(y), nan=0.0, posinf=0.0, neginf=0.0)
 
 
-class CausalConv2dTime(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, kernel_size: int, dilation: int):
+class CausalConv1d(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int, kernel_size: int, dilation: int = 1):
         super().__init__()
-        self.k = int(kernel_size)
-        self.d = int(dilation)
-        self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=(1, self.k), dilation=(1, self.d))
+        self.kernel_size = int(kernel_size)
+        self.dilation = int(dilation)
+        self.conv = nn.Conv1d(in_ch, out_ch, kernel_size=self.kernel_size, dilation=self.dilation)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        pad_left = (self.k - 1) * self.d
-        x = F.pad(x, (pad_left, 0, 0, 0))
+        pad_left = (self.kernel_size - 1) * self.dilation
+        x = F.pad(x, (pad_left, 0))
         return self.conv(x)
 
 
-def graph_message_passing(x: torch.Tensor, A: torch.Tensor) -> torch.Tensor:
-    return torch.einsum("bcnt,bnm->bcmt", x, A)
-
-
-class GraphWaveNetBlock(nn.Module):
-    def __init__(self, residual_ch: int, dilation_ch: int, skip_ch: int, kernel_size: int, dilation: int, dropout: float):
+class TemporalBlock(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int, kernel_size: int, dilation: int, dropout: float, causal: bool = True):
         super().__init__()
-        self.filter_conv = CausalConv2dTime(residual_ch, dilation_ch, kernel_size=kernel_size, dilation=dilation)
-        self.gate_conv = CausalConv2dTime(residual_ch, dilation_ch, kernel_size=kernel_size, dilation=dilation)
+        self.causal = bool(causal)
 
-        self.residual_conv = nn.Conv2d(dilation_ch, residual_ch, kernel_size=(1, 1))
-        self.skip_conv = nn.Conv2d(dilation_ch, skip_ch, kernel_size=(1, 1))
+        if self.causal:
+            self.conv1 = CausalConv1d(in_ch, out_ch, kernel_size, dilation=dilation)
+            self.conv2 = CausalConv1d(out_ch, out_ch, kernel_size, dilation=dilation)
+        else:
+            pad = ((kernel_size - 1) * dilation) // 2
+            self.conv1 = nn.Conv1d(in_ch, out_ch, kernel_size, dilation=dilation, padding=pad)
+            self.conv2 = nn.Conv1d(out_ch, out_ch, kernel_size, dilation=dilation, padding=pad)
 
-        self.dropout = nn.Dropout(float(dropout))
-        self.bn = nn.BatchNorm2d(residual_ch)
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(float(dropout))
+        self.downsample = nn.Identity() if in_ch == out_ch else nn.Conv1d(in_ch, out_ch, kernel_size=1)
 
-    def forward(self, x: torch.Tensor, A: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
-        A = torch.nan_to_num(A, nan=0.0, posinf=0.0, neginf=0.0)
-
-        residual = x
-
-        f = torch.tanh(self.filter_conv(x))
-        g = torch.sigmoid(self.gate_conv(x))
-        z = f * g
-        z = self.dropout(z)
-
-        skip = self.skip_conv(z)
-        out = self.residual_conv(z)
-        out = graph_message_passing(out, A)
-        out = out + residual
-        out = self.bn(out)
-
-        out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
-        skip = torch.nan_to_num(skip, nan=0.0, posinf=0.0, neginf=0.0)
-        return out, skip
+        y = self.drop(self.act(self.conv1(x)))
+        y = self.drop(self.act(self.conv2(y)))
+        res = self.downsample(x)
+        return torch.nan_to_num(self.act(y + res), nan=0.0, posinf=0.0, neginf=0.0)
 
 
-class GraphWaveNetTwoHeadFixedH(nn.Module):
-    """
-    Input:
-      x_seq: (B,L,N,F)
-      e_seq: (B,L,E,D) used only for building A_prior from last step
-
-    Output (target node):
-      trade_logit: (B,) trade probability logit
-      dir_logit:   (B,) direction logit (prob LONG given trade)
-      fixed_hat:   (B,) predicted fixed-horizon future return
-    """
-    def __init__(self, node_in: int, edge_dim: int, cfg: Dict[str, Any], n_nodes: int, target_node: int):
+class TemporalConvNet(nn.Module):
+    def __init__(self, in_ch: int, channels: List[int], kernel_size: int, dropout: float, causal: bool = True):
         super().__init__()
-        self.cfg = cfg
+        layers = []
+        cur = int(in_ch)
+        for i, out_ch in enumerate(channels):
+            dilation = 2 ** i
+            layers.append(TemporalBlock(cur, int(out_ch), int(kernel_size), int(dilation), float(dropout), causal=causal))
+            cur = int(out_ch)
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class AttnPool1D(nn.Module):
+    """
+    Lightweight attention pooling over time.
+    Input:  y (B,C,L)
+    Output: pooled (B,C)
+    """
+    def __init__(self, channels: int, hidden: int, dropout: float):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Conv1d(channels, hidden, kernel_size=1),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Conv1d(hidden, 1, kernel_size=1),
+        )
+
+        for m in self.modules():
+            if isinstance(m, nn.Conv1d):
+                nn.init.kaiming_uniform_(m.weight, a=math.sqrt(5))
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        y = torch.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
+        scores = self.proj(y)                 # (B,1,L)
+        attn = torch.softmax(scores, dim=-1)  # (B,1,L)
+        pooled = (attn * y).sum(dim=-1)       # (B,C)
+        return pooled, attn.squeeze(1)        # (B,C), (B,L)
+
+
+class MTGNN_ConvAttn_Classifier(nn.Module):
+    """
+    forward(x_seq, e_seq, edge_index) -> logits (B,2)
+    Also supports returning aux losses:
+      forward(..., return_aux=True) -> (logits, aux_dict)
+    """
+    def __init__(self, node_in: int, edge_dim: int, cfg: Dict[str, Any], n_nodes: int, target_node: int, n_classes: int = 2):
+        super().__init__()
         self.n_nodes = int(n_nodes)
         self.target_node = int(target_node)
 
-        residual_ch = int(cfg["gwn_residual_channels"])
-        dilation_ch = int(cfg["gwn_dilation_channels"])
-        skip_ch = int(cfg["gwn_skip_channels"])
-        end_ch = int(cfg["gwn_end_channels"])
-        k = int(cfg["gwn_kernel_size"])
-        blocks = int(cfg["gwn_blocks"])
-        layers_per_block = int(cfg["gwn_layers_per_block"])
-        drop = float(cfg.get("dropout", 0.0))
+        hidden = int(cfg["hidden"])
+        dropout = float(cfg["dropout"])
 
-        self.in_proj = nn.Linear(int(node_in), residual_ch)
+        # adjacency modules
+        self.learn_adj = LearnableAdjacency(self.n_nodes, cfg)
 
-        A_static = build_static_adjacency_from_edges(EDGE_INDEX, n_nodes=self.n_nodes)
-        self.register_buffer("A_static", A_static)
+        # node feature projection
+        self.in_proj = nn.Sequential(
+            nn.Linear(int(node_in), hidden),
+            nn.LayerNorm(hidden),
+        )
 
-        self.adapt = AdaptiveAdjacency(n_nodes=self.n_nodes, cfg=cfg)
-        self.support_mix = LearnableSupportMix(n_supports=3)
+        # graph layers (use A_final for message passing)
+        self.gnn_layers = nn.ModuleList([GraphMixLayer(hidden, dropout=dropout) for _ in range(int(cfg["gnn_layers"]))])
 
-        self.blocks = nn.ModuleList()
-        for _b in range(blocks):
-            for l in range(layers_per_block):
-                dilation = 2 ** l
-                self.blocks.append(GraphWaveNetBlock(
-                    residual_ch=residual_ch,
-                    dilation_ch=dilation_ch,
-                    skip_ch=skip_ch,
-                    kernel_size=k,
-                    dilation=dilation,
-                    dropout=drop,
-                ))
+        # temporal conv + attention pooling on target node trajectory
+        tcn_channels = int(cfg["tcn_channels"])
+        tcn_layers_n = int(cfg["tcn_layers"])
+        tcn_kernel = int(cfg["tcn_kernel"])
+        tcn_dropout = float(cfg["tcn_dropout"])
+        tcn_causal = bool(cfg["tcn_causal"])
 
-        self.end1 = nn.Conv2d(skip_ch, end_ch, kernel_size=(1, 1))
-        self.trade_head = nn.Linear(end_ch, 1)
-        self.dir_head = nn.Linear(end_ch, 1)
-        self.fixed_head = nn.Linear(end_ch, 1)
+        self.tcn_in = nn.Linear(hidden, tcn_channels)
+        self.tcn = TemporalConvNet(
+            in_ch=tcn_channels,
+            channels=[tcn_channels] * tcn_layers_n,
+            kernel_size=tcn_kernel,
+            dropout=tcn_dropout,
+            causal=tcn_causal,
+        )
+
+        self.pool = AttnPool1D(
+            channels=tcn_channels,
+            hidden=int(cfg.get("attn_pool_hidden", tcn_channels)),
+            dropout=float(cfg.get("attn_pool_dropout", 0.1)),
+        )
+
+        self.head = nn.Sequential(
+            nn.LayerNorm(tcn_channels),
+            nn.Dropout(dropout),
+            nn.Linear(tcn_channels, tcn_channels),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(tcn_channels, n_classes),
+        )
 
         for m in self.modules():
-            if isinstance(m, (nn.Conv2d, nn.Linear)):
+            if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def _compute_supports(self, e_seq: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    def _compute_A_final(self, e_seq: torch.Tensor, edge_index: torch.Tensor, cfg: Dict[str, Any]) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """
+        e_seq: (B,L,E,D)
+        Build A_prior from last timestep, mix with A_learned.
+        Return A_final (B,N,N) and aux dict with reg terms.
+        """
         B, L_, E, D = e_seq.shape
-        e_last = e_seq[:, -1, :, :]
+        e_last = e_seq[:, -1, :, :]  # (B,E,D)
 
         A_prior = build_adj_prior_from_edge_attr(
             edge_attr_last=e_last,
-            edge_index=EDGE_INDEX.to(e_seq.device),
+            edge_index=edge_index,
             n_nodes=self.n_nodes,
-            use_abs=bool(self.cfg.get("prior_use_abs", False)),
-            diag_boost=float(self.cfg.get("prior_diag_boost", 1.0)),
-            row_normalize=bool(self.cfg.get("prior_row_normalize", True)),
-        )
+            use_abs=bool(cfg.get("prior_use_abs", False)),
+            diag_boost=float(cfg.get("prior_diag_boost", 1.0)),
+            row_normalize=bool(cfg.get("prior_row_normalize", True)),
+        )  # (B,N,N)
 
-        A_adapt_base, sparsity_proxy, _ = self.adapt()
-        A_adapt = A_adapt_base.unsqueeze(0).expand(B, -1, -1)
+        A_learned_base, sparsity_proxy = self.learn_adj()  # (N,N), (N,N)
+        A_learned = A_learned_base.unsqueeze(0).expand(B, -1, -1)  # (B,N,N)
 
-        w = self.support_mix()
-        A_static = self.A_static.to(e_seq.device).to(e_seq.dtype).unsqueeze(0).expand(B, -1, -1)
+        alpha = self.learn_adj.alpha().to(e_seq.device).to(e_seq.dtype)  # scalar
+        A_final = alpha * A_prior + (1.0 - alpha) * A_learned
 
-        A_mix = w[0] * A_static + w[1] * A_prior + w[2] * A_adapt
-        A_mix = A_mix / (A_mix.sum(dim=-1, keepdim=True) + 1e-8)
-
+        # regularization
         N = self.n_nodes
         offdiag = (1.0 - torch.eye(N, device=e_seq.device, dtype=e_seq.dtype))
-        l1_off = (sparsity_proxy.to(e_seq.dtype) * offdiag).abs().mean()
-        mse_prior = ((A_adapt - A_prior) ** 2 * offdiag).mean()
+        l1_off = (sparsity_proxy * offdiag).abs().mean()
+        mse_prior = ((A_learned - A_prior) ** 2 * offdiag).mean()
 
         aux = {
-            "support_w": w.detach().cpu().numpy().tolist(),
+            "alpha": float(alpha.detach().cpu().item()),
+            "l1_off": float(l1_off.detach().cpu().item()),
+            "mse_prior": float(mse_prior.detach().cpu().item()),
+            # keep tensors for loss composition
             "_l1_off_t": l1_off,
             "_mse_prior_t": mse_prior,
         }
-        return A_mix, aux
+        return A_final, aux
 
-    def forward(self, x_seq: torch.Tensor, e_seq: torch.Tensor, return_aux: bool = False):
-        x_seq = torch.nan_to_num(x_seq, nan=0.0, posinf=0.0, neginf=0.0)
-        e_seq = torch.nan_to_num(e_seq, nan=0.0, posinf=0.0, neginf=0.0)
+    def forward(
+        self,
+        x: torch.Tensor,
+        e: torch.Tensor,
+        edge_index: torch.Tensor,
+        cfg: Optional[Dict[str, Any]] = None,
+        return_aux: bool = False
+    ):
+        cfg = CFG if cfg is None else cfg
 
-        B, L_, N, Fdim = x_seq.shape
-        assert N == self.n_nodes
+        x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        e = torch.nan_to_num(e, nan=0.0, posinf=0.0, neginf=0.0)
 
-        x = self.in_proj(x_seq)                 # (B,L,N,C)
-        x = x.permute(0, 3, 2, 1).contiguous()  # (B,C,N,T)
+        B, L_, N, Fin = x.shape
+        assert N == self.n_nodes, f"Expected N={self.n_nodes}, got {N}"
 
-        A_mix, aux = self._compute_supports(e_seq)
+        A_final, aux = self._compute_A_final(e, edge_index, cfg)
 
-        skip_sum = None
-        for blk in self.blocks:
-            x, skip = blk(x, A_mix)
-            skip_sum = skip if skip_sum is None else (skip_sum + skip)
+        h = self.in_proj(x)  # (B,L,N,H)
+        for gnn in self.gnn_layers:
+            h = gnn(h, A_final)  # (B,L,N,H)
 
-        y = F.relu(skip_sum)
-        y_end = F.relu(self.end1(y))            # (B,end_ch,N,T)
-        feat = y_end[:, :, self.target_node, -1]  # (B,end_ch)
+        h_tgt = h[:, :, self.target_node, :]  # (B,L,H)
+        z = self.tcn_in(h_tgt)                # (B,L,C)
+        z = z.transpose(1, 2)                 # (B,C,L)
+        y = self.tcn(z)                       # (B,C,L)
+        emb, attn_w = self.pool(y)            # (B,C), (B,L)
 
-        trade_logit = self.trade_head(feat).squeeze(-1)
-        dir_logit = self.dir_head(feat).squeeze(-1)
-        fixed_hat = self.fixed_head(feat).squeeze(-1)
-
-        trade_logit = torch.nan_to_num(trade_logit, nan=0.0, posinf=0.0, neginf=0.0)
-        dir_logit = torch.nan_to_num(dir_logit, nan=0.0, posinf=0.0, neginf=0.0)
-        fixed_hat = torch.nan_to_num(fixed_hat, nan=0.0, posinf=0.0, neginf=0.0)
+        logits = self.head(emb)               # (B,2)
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
 
         if return_aux:
-            return trade_logit, dir_logit, fixed_hat, aux
-        return trade_logit, dir_logit, fixed_hat
+            aux["attn_mean"] = float(attn_w.mean().detach().cpu().item())
+            aux["attn_max"] = float(attn_w.max().detach().cpu().item())
+            return logits, aux
+        return logits
+
+
+# sanity
+B_ = 2
+Fdim = X_node_raw.shape[-1]
+E_ = EDGE_INDEX.shape[0]
+Dedge = edge_feat.shape[-1]
+x_dummy = torch.randn(B_, L, len(ASSETS), Fdim)
+e_dummy = torch.randn(B_, L, E_, Dedge)
+m_dummy = MTGNN_ConvAttn_Classifier(node_in=Fdim, edge_dim=Dedge, cfg=CFG, n_nodes=len(ASSETS), target_node=TARGET_NODE).to(DEVICE)
+with torch.no_grad():
+    out, aux = m_dummy(x_dummy.to(DEVICE), e_dummy.to(DEVICE), EDGE_INDEX.to(DEVICE), cfg=CFG, return_aux=True)
+print("Model sanity logits:", out.shape, "| finite:", bool(torch.isfinite(out).all().item()))
+print("Aux sanity:", {k: aux[k] for k in ["alpha", "l1_off", "mse_prior", "attn_mean", "attn_max"]})
+
+
+# %% [markdown]
+# ## Step 8 — Train/Eval helpers (AUC-oriented) + adjacency regularization
 
 # %%
-# ======================================================================
-# Step 8: Metrics, thresholding, losses (two-head + fixed-horizon utility)
-# ======================================================================
-
-def _safe_auc_binary(y_true: np.ndarray, score: np.ndarray) -> float:
-    y_true = np.asarray(y_true, dtype=np.int64)
-    score = np.asarray(score, dtype=np.float64)
-    if y_true.size == 0 or len(np.unique(y_true)) < 2:
-        return float("nan")
-    return float(roc_auc_score(y_true, score))
+def make_ce_weights_binary(y_np: np.ndarray) -> torch.Tensor:
+    y_np = np.asarray(y_np, dtype=np.int64)
+    counts = np.bincount(y_np, minlength=2).astype(np.float64)
+    counts = np.maximum(counts, 1.0)
+    w = counts.sum() / (2.0 * counts)
+    return torch.tensor(w, dtype=torch.float32, device=DEVICE)
 
 
-def probs3_from_twohead(p_trade: np.ndarray, p_dir: np.ndarray) -> np.ndarray:
-    """
-    Convert two-head outputs to a 3-class distribution:
-      p_flat = 1 - p_trade
-      p_long = p_trade * p_dir
-      p_short = p_trade * (1 - p_dir)
-    """
-    p_trade = np.asarray(p_trade, dtype=np.float64)
-    p_dir = np.asarray(p_dir, dtype=np.float64)
-    p_flat = 1.0 - p_trade
-    p_long = p_trade * p_dir
-    p_short = p_trade * (1.0 - p_dir)
-    prob3 = np.stack([p_short, p_flat, p_long], axis=1)
-    prob3 = np.clip(prob3, 1e-12, 1.0)
-    prob3 = prob3 / prob3.sum(axis=1, keepdims=True)
-    return prob3
+def make_weighted_sampler_from_labels(y_np: np.ndarray) -> WeightedRandomSampler:
+    y_np = np.asarray(y_np, dtype=np.int64)
+    counts = np.bincount(y_np, minlength=2).astype(np.float64)
+    counts = np.maximum(counts, 1.0)
+    class_w = counts.sum() / (2.0 * counts)
+    sample_w = class_w[y_np].astype(np.float64)
+    sample_w = torch.tensor(sample_w, dtype=torch.double)
+    return WeightedRandomSampler(weights=sample_w, num_samples=len(sample_w), replacement=True)
 
 
-def compute_trade_dir_auc_from_twohead(y_trade_true: np.ndarray, y_tb_true: np.ndarray, p_trade: np.ndarray, p_dir: np.ndarray) -> Tuple[float, float]:
-    """
-    trade_auc: y_trade_true vs p_trade
-    dir_auc: LONG vs SHORT only on true trades; score = p_dir
-    """
-    y_trade_true = np.asarray(y_trade_true, dtype=np.int64)
-    y_tb_true = np.asarray(y_tb_true, dtype=np.int64)
-    p_trade = np.asarray(p_trade, dtype=np.float64)
-    p_dir = np.asarray(p_dir, dtype=np.float64)
-
-    trade_auc = _safe_auc_binary(y_trade_true, p_trade)
-
-    mask_trade = (y_tb_true != 1)
-    y_dir_bin = (y_tb_true[mask_trade] == 2).astype(np.int64)
-    dir_auc = _safe_auc_binary(y_dir_bin, p_dir[mask_trade])
-
-    return trade_auc, dir_auc
+def total_loss_with_adj_reg(ce_loss: torch.Tensor, aux: Dict[str, Any], cfg: Dict[str, Any]) -> torch.Tensor:
+    lam_l1 = float(cfg.get("adj_l1_lambda", 0.0))
+    lam_pr = float(cfg.get("adj_prior_lambda", 0.0))
+    reg = 0.0
+    if lam_l1 > 0:
+        reg = reg + lam_l1 * aux["_l1_off_t"]
+    if lam_pr > 0:
+        reg = reg + lam_pr * aux["_mse_prior_t"]
+    return ce_loss + reg
 
 
-def pnl_from_probs_3class(prob3: np.ndarray, exit_ret_arr: np.ndarray, thr_trade: float, thr_dir: float, cost_bps: float) -> Dict[str, Any]:
-    prob3 = np.asarray(prob3, dtype=np.float64)
-    exit_ret_arr = np.asarray(exit_ret_arr, dtype=np.float64)
+@torch.no_grad()
+def eval_binary(model: nn.Module, loader: DataLoader, loss_fn: nn.Module, y_key: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
+    model.eval()
+    total_loss = 0.0
+    n = 0
 
-    p_short = prob3[:, 0]
-    p_flat = prob3[:, 1]
-    p_long = prob3[:, 2]
+    ys = []
+    probs = []
+    ers = []
+    aux_accum = {"alpha": [], "l1_off": [], "mse_prior": []}
 
-    trade_conf = 1.0 - p_flat
-    dir_prob = p_long / (p_long + p_short + 1e-12)
-    dir_conf = np.maximum(dir_prob, 1.0 - dir_prob)
+    for x, e, y_trade_b, y_dir_b, er in loader:
+        x = x.to(DEVICE).float()
+        e = e.to(DEVICE).float()
+        y = (y_trade_b if y_key == "trade" else y_dir_b).to(DEVICE).long()
 
-    mask = (trade_conf >= float(thr_trade)) & (dir_conf >= float(thr_dir))
+        logits, aux = model(x, e, EDGE_INDEX.to(DEVICE), cfg=cfg, return_aux=True)
+        ce = loss_fn(logits, y)
+        loss = total_loss_with_adj_reg(ce, aux, cfg)
 
-    action = np.zeros_like(exit_ret_arr, dtype=np.float64)
-    action[mask] = np.where(dir_prob[mask] >= 0.5, 1.0, -1.0)
+        total_loss += float(loss.item()) * int(y.size(0))
+        n += int(y.size(0))
 
-    cost = (float(cost_bps) * 1e-4) * mask.astype(np.float64)
-    pnl = action * exit_ret_arr - cost
+        p = torch.softmax(logits, dim=-1).detach().cpu().numpy()
+        ys.append(y.detach().cpu().numpy())
+        probs.append(p)
+        ers.append(er.detach().cpu().numpy())
 
-    n = int(len(exit_ret_arr))
-    n_tr = int(mask.sum())
+        aux_accum["alpha"].append(aux["alpha"])
+        aux_accum["l1_off"].append(aux["l1_off"])
+        aux_accum["mse_prior"].append(aux["mse_prior"])
 
-    return {
-        "n": n,
-        "n_trades": n_tr,
-        "trade_rate": float(n_tr / max(1, n)),
-        "pnl_sum": float(pnl.sum()),
-        "pnl_mean": float(pnl.mean()) if n else float("nan"),
-        "pnl_per_trade": float(pnl.sum() / max(1, n_tr)),
+    ys = np.concatenate(ys) if ys else np.array([], dtype=np.int64)
+    probs = np.concatenate(probs) if probs else np.zeros((0, 2), dtype=np.float32)
+    ers = np.concatenate(ers) if ers else np.array([], dtype=np.float32)
+
+    if len(ys) == 0:
+        return {"loss": np.nan, "acc": np.nan, "f1m": np.nan, "auc": np.nan, "cm": None, "y": ys, "prob": probs, "er": ers}
+
+    y_pred = probs.argmax(axis=1)
+    acc = accuracy_score(ys, y_pred)
+    f1m = f1_score(ys, y_pred, average="macro")
+    auc = roc_auc_score(ys, probs[:, 1]) if len(np.unique(ys)) == 2 else np.nan
+    cm = confusion_matrix(ys, y_pred)
+
+    out = {
+        "loss": total_loss / max(1, n),
+        "acc": float(acc),
+        "f1m": float(f1m),
+        "auc": float(auc) if np.isfinite(auc) else np.nan,
+        "cm": cm,
+        "y": ys,
+        "prob": probs,
+        "er": ers,
     }
+    if aux_accum["alpha"]:
+        out["adj_alpha_mean"] = float(np.mean(aux_accum["alpha"]))
+        out["adj_l1_off_mean"] = float(np.mean(aux_accum["l1_off"]))
+        out["adj_mse_prior_mean"] = float(np.mean(aux_accum["mse_prior"]))
+    return out
 
 
-def build_trade_threshold_grid(p_trade: np.ndarray, base_grid: Optional[List[float]], target_trades_list: Optional[List[int]]) -> List[float]:
+def train_binary_classifier(
+    X_scaled: np.ndarray,
+    edge_scaled: np.ndarray,
+    y_trade_arr: np.ndarray,
+    y_dir_arr: np.ndarray,
+    exit_ret_arr: np.ndarray,
+    sample_t_: np.ndarray,
+    idx_train: np.ndarray,
+    idx_val: np.ndarray,
+    idx_test: np.ndarray,
+    cfg: Dict[str, Any],
+    stage_name: str,  # "trade" or "dir"
+) -> Tuple[nn.Module, Dict[str, Any]]:
+    assert stage_name in ("trade", "dir")
+
+    L_ = int(cfg["lookback"])
+    bs = int(cfg["batch_size"])
+
+    tr_ds = LobGraphSequenceDataset2Stage(X_scaled, edge_scaled, y_trade_arr, y_dir_arr, exit_ret_arr, sample_t_, idx_train, L_)
+    va_ds = LobGraphSequenceDataset2Stage(X_scaled, edge_scaled, y_trade_arr, y_dir_arr, exit_ret_arr, sample_t_, idx_val,   L_)
+    te_ds = LobGraphSequenceDataset2Stage(X_scaled, edge_scaled, y_trade_arr, y_dir_arr, exit_ret_arr, sample_t_, idx_test,  L_)
+
+    # labels for sampler/weights (TRAIN only)
+    t_train = sample_t_[idx_train]
+    y_train_np = (y_trade_arr[t_train] if stage_name == "trade" else y_dir_arr[t_train]).astype(np.int64)
+
+    sampler = None
+    shuffle = True
+    if bool(cfg.get("use_weighted_sampler", True)):
+        sampler = make_weighted_sampler_from_labels(y_train_np)
+        shuffle = False
+
+    tr_loader = DataLoader(tr_ds, batch_size=bs, shuffle=shuffle, sampler=sampler, drop_last=False, collate_fn=collate_fn_2stage, num_workers=0)
+    va_loader = DataLoader(va_ds, batch_size=bs, shuffle=False, drop_last=False, collate_fn=collate_fn_2stage, num_workers=0)
+    te_loader = DataLoader(te_ds, batch_size=bs, shuffle=False, drop_last=False, collate_fn=collate_fn_2stage, num_workers=0)
+
+    node_in = int(X_scaled.shape[-1])
+    edge_dim = int(edge_scaled.shape[-1])
+
+    model = MTGNN_ConvAttn_Classifier(
+        node_in=node_in,
+        edge_dim=edge_dim,
+        cfg=cfg,
+        n_nodes=len(ASSETS),
+        target_node=TARGET_NODE,
+        n_classes=2,
+    ).to(DEVICE)
+
+    ce_w = make_ce_weights_binary(y_train_np)
+    loss_fn = nn.CrossEntropyLoss(weight=ce_w, label_smoothing=float(cfg.get("label_smoothing", 0.0)))
+
+    opt = torch.optim.AdamW(model.parameters(), lr=float(cfg["lr"]), weight_decay=float(cfg["weight_decay"]))
+
+    use_onecycle = bool(cfg.get("use_onecycle", True))
+    if use_onecycle:
+        sch = torch.optim.lr_scheduler.OneCycleLR(
+            opt,
+            max_lr=float(cfg["lr"]),
+            epochs=int(cfg["epochs"]),
+            steps_per_epoch=max(1, len(tr_loader)),
+            pct_start=0.15,
+            div_factor=10.0,
+            final_div_factor=50.0,
+        )
+    else:
+        sch = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="max", factor=0.5, patience=3)
+
+    best_auc = -1e18
+    best_state = None
+    best_epoch = -1
+    patience = 7
+    bad = 0
+
+    for ep in range(1, int(cfg["epochs"]) + 1):
+        model.train()
+        tot_loss = 0.0
+        n = 0
+
+        for x, e, y_trade_b, y_dir_b, _er in tr_loader:
+            x = x.to(DEVICE).float()
+            e = e.to(DEVICE).float()
+            y = (y_trade_b if stage_name == "trade" else y_dir_b).to(DEVICE).long()
+
+            opt.zero_grad(set_to_none=True)
+
+            logits, aux = model(x, e, EDGE_INDEX.to(DEVICE), cfg=cfg, return_aux=True)
+            ce = loss_fn(logits, y)
+            loss = total_loss_with_adj_reg(ce, aux, cfg)
+
+            if not torch.isfinite(loss):
+                continue
+
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), float(cfg["grad_clip"]))
+            opt.step()
+
+            if use_onecycle:
+                sch.step()
+
+            tot_loss += float(loss.item()) * int(y.size(0))
+            n += int(y.size(0))
+
+        tr_loss = tot_loss / max(1, n)
+
+        va = eval_binary(model, va_loader, loss_fn, y_key=stage_name, cfg=cfg)
+        va_auc = va["auc"]
+        sel_auc = float(va_auc) if np.isfinite(va_auc) else -1e18
+
+        if sel_auc > best_auc:
+            best_auc = sel_auc
+            best_epoch = ep
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            bad = 0
+        else:
+            bad += 1
+
+        if not use_onecycle:
+            sch.step(sel_auc)
+
+        lr_now = opt.param_groups[0]["lr"]
+        print(
+            f"[{stage_name}] ep {ep:02d} lr={lr_now:.2e} "
+            f"tr_loss={tr_loss:.4f} va_loss={va['loss']:.4f} va_auc={va_auc:.3f} "
+            f"alpha={va.get('adj_alpha_mean', float('nan')):.3f} "
+            f"reg(l1={va.get('adj_l1_off_mean', float('nan')):.4f}, prior={va.get('adj_mse_prior_mean', float('nan')):.4f}) "
+            f"best={best_auc:.3f}@ep{best_epoch:02d}"
+        )
+
+        if bad >= patience:
+            break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    va = eval_binary(model, va_loader, loss_fn, y_key=stage_name, cfg=cfg)
+    te = eval_binary(model, te_loader, loss_fn, y_key=stage_name, cfg=cfg)
+
+    res = {
+        "best_epoch": int(best_epoch),
+        "best_val_auc": float(best_auc) if np.isfinite(best_auc) else np.nan,
+        "val": va,
+        "test": te,
+    }
+    return model, res
+
+
+# %% [markdown]
+# ## Step 9 — Two-stage PnL + threshold sweep (val only)
+
+# %%
+def build_trade_threshold_grid(
+    p_trade: np.ndarray,
+    base_grid: Optional[List[float]] = None,
+    target_trades_list: Optional[List[int]] = None,
+    min_thr: float = 0.01,
+    max_thr: float = 0.99,
+) -> List[float]:
     p_trade = np.asarray(p_trade, dtype=np.float64)
     p_trade = p_trade[np.isfinite(p_trade)]
     if p_trade.size == 0:
@@ -1096,7 +1617,7 @@ def build_trade_threshold_grid(p_trade: np.ndarray, base_grid: Optional[List[flo
             else:
                 q = 1.0 - (k / N)
                 thr = float(np.quantile(p_trade, q))
-            thrs.add(float(np.clip(thr, 0.01, 0.99)))
+            thrs.add(float(np.clip(thr, min_thr, max_thr)))
 
     out = sorted(thrs)
     cleaned = []
@@ -1106,14 +1627,59 @@ def build_trade_threshold_grid(p_trade: np.ndarray, base_grid: Optional[List[flo
     return cleaned
 
 
-def sweep_thresholds_3class(prob3: np.ndarray, exit_ret_arr: np.ndarray, cfg: Dict[str, Any], min_trades: int, target_trade_rate: Optional[float]) -> pd.DataFrame:
-    prob3 = np.asarray(prob3, dtype=np.float64)
-    p_trade = 1.0 - prob3[:, 1]
+def two_stage_trade_mask(prob_trade: np.ndarray, prob_dir: np.ndarray, thr_trade: float, thr_dir: float) -> np.ndarray:
+    p_trade = prob_trade[:, 1]
+    p_up = prob_dir[:, 1]
+    conf_dir = np.maximum(p_up, 1.0 - p_up)
+    return (p_trade >= float(thr_trade)) & (conf_dir >= float(thr_dir))
 
+
+def two_stage_pnl_by_threshold(
+    prob_trade: np.ndarray,
+    prob_dir: np.ndarray,
+    exit_ret_arr: np.ndarray,
+    thr_trade: float,
+    thr_dir: float,
+    cost_bps: float,
+) -> Dict[str, Any]:
+    p_up = prob_dir[:, 1]
+    mask = two_stage_trade_mask(prob_trade, prob_dir, thr_trade, thr_dir)
+
+    action = np.zeros_like(exit_ret_arr, dtype=np.float32)
+    action[mask] = np.where(p_up[mask] >= 0.5, 1.0, -1.0).astype(np.float32)
+
+    cost = (float(cost_bps) * 1e-4) * mask.astype(np.float32)
+    pnl = action * exit_ret_arr - cost
+
+    n = int(len(exit_ret_arr))
+    n_tr = int(mask.sum())
+
+    return {
+        "n": n,
+        "n_trades": n_tr,
+        "trade_rate": float(n_tr / max(1, n)),
+        "pnl_sum": float(pnl.sum()),
+        "pnl_mean": float(pnl.mean()) if n else np.nan,
+        "pnl_per_trade": float(pnl.sum() / max(1, n_tr)),
+        "pnl_sharpe": float((pnl.mean() / (pnl.std() + 1e-12)) * np.sqrt(288)) if n else np.nan,
+    }
+
+
+def sweep_thresholds(
+    prob_trade: np.ndarray,
+    prob_dir: np.ndarray,
+    exit_ret_arr: np.ndarray,
+    cfg: Dict[str, Any],
+    min_trades: int = 0,
+    target_trade_rate: Optional[float] = None,
+) -> pd.DataFrame:
+    p_trade = prob_trade[:, 1]
     thr_trade_grid = build_trade_threshold_grid(
         p_trade=p_trade,
         base_grid=cfg.get("thr_trade_grid", [0.5]),
         target_trades_list=cfg.get("proxy_target_trades", None),
+        min_thr=0.01,
+        max_thr=0.99,
     )
     thr_dir_grid = cfg.get("thr_dir_grid", [0.5])
 
@@ -1124,7 +1690,7 @@ def sweep_thresholds_3class(prob3: np.ndarray, exit_ret_arr: np.ndarray, cfg: Di
     rows = []
     for thr_t in thr_trade_grid:
         for thr_d in thr_dir_grid:
-            m = pnl_from_probs_3class(prob3, exit_ret_arr, thr_t, thr_d, cfg["cost_bps"])
+            m = two_stage_pnl_by_threshold(prob_trade, prob_dir, exit_ret_arr, thr_t, thr_d, cfg["cost_bps"])
             if int(m["n_trades"]) < int(min_trades):
                 continue
             if max_rate is not None and float(m["trade_rate"]) > float(max_rate):
@@ -1142,845 +1708,584 @@ def sweep_thresholds_3class(prob3: np.ndarray, exit_ret_arr: np.ndarray, cfg: Di
             rows.append({"thr_trade": float(thr_t), "thr_dir": float(thr_d), "score": float(score), **m})
 
     if not rows:
-        return sweep_thresholds_3class(prob3, exit_ret_arr, cfg, min_trades=1, target_trade_rate=target_trade_rate)
+        return sweep_thresholds(prob_trade, prob_dir, exit_ret_arr, cfg, min_trades=1, target_trade_rate=target_trade_rate)
 
-    return pd.DataFrame(rows).sort_values(["score", "pnl_sum"], ascending=False)
+    df_ = pd.DataFrame(rows).sort_values(["score", "pnl_sum"], ascending=False)
+    return df_
 
-
-def total_loss_with_adj_reg(loss: torch.Tensor, aux: Dict[str, Any], cfg: Dict[str, Any]) -> torch.Tensor:
-    lam_l1 = float(cfg.get("adj_l1_lambda", 0.0))
-    lam_pr = float(cfg.get("adj_prior_lambda", 0.0))
-    reg = 0.0
-    if lam_l1 > 0:
-        reg = reg + lam_l1 * aux["_l1_off_t"]
-    if lam_pr > 0:
-        reg = reg + lam_pr * aux["_mse_prior_t"]
-    return loss + reg
-
-
-def compute_pos_weights_binary(y: np.ndarray) -> torch.Tensor:
-    """
-    pos_weight for BCEWithLogitsLoss:
-      pos_weight = n_neg / n_pos
-    """
-    y = np.asarray(y, dtype=np.int64)
-    n_pos = float((y == 1).sum())
-    n_neg = float((y == 0).sum())
-    n_pos = max(n_pos, 1.0)
-    return torch.tensor([n_neg / n_pos], dtype=torch.float32, device=DEVICE)
-
-
-def multitask_loss_twohead_fixedH(
-    trade_logit: torch.Tensor,
-    dir_logit: torch.Tensor,
-    fixed_hat: torch.Tensor,
-    y_trade_batch: torch.Tensor,
-    y_dir_batch: torch.Tensor,
-    fixed_ret_batch: torch.Tensor,
-    bce_trade: nn.Module,
-    bce_dir: nn.Module,
-    cfg: Dict[str, Any],
-) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """
-    Total = w_trade*BCE(trade) + w_dir*BCE(dir | trade) + w_ret*Huber + w_util*(-scaled_utility)
-
-    Utility uses fixed_ret:
-      p_trade = sigmoid(trade_logit)
-      p_dir   = sigmoid(dir_logit)
-      signed_dir = 2*p_dir - 1 in [-1,1]
-      pos = p_trade * tanh(k*signed_dir)
-      utility = pos * fixed_ret - fee * |pos|
-      utility_scaled = utility_scale * utility
-      util_loss = -mean(utility_scaled)
-    """
-    w_tr = float(cfg["loss_w_trade"])
-    w_dr = float(cfg["loss_w_dir"])
-    w_ret = float(cfg["loss_w_ret"])
-    w_ut = float(cfg["loss_w_utility"])
-
-    loss_trade = bce_trade(trade_logit, y_trade_batch)
-
-    mask = (y_trade_batch > 0.5)
-    if mask.any():
-        loss_dir = bce_dir(dir_logit[mask], y_dir_batch[mask])
-    else:
-        loss_dir = torch.zeros((), device=trade_logit.device)
-
-    clip_val = float(cfg.get("fixed_ret_clip", 0.0))
-    fr = torch.clamp(fixed_ret_batch, -clip_val, clip_val) if (clip_val and clip_val > 0) else fixed_ret_batch
-
-    delta = float(cfg.get("ret_huber_delta", 0.01))
-    loss_ret = F.huber_loss(fixed_hat, fr, delta=delta)
-
-    p_trade = torch.sigmoid(trade_logit)
-    p_dir = torch.sigmoid(dir_logit)
-    signed_dir = 2.0 * p_dir - 1.0
-    k = float(cfg.get("utility_k", 2.0))
-    pos = p_trade * torch.tanh(k * signed_dir)
-
-    fee = float(cfg.get("cost_bps", 0.0)) * 1e-4
-    utility = pos * fr - fee * torch.abs(pos)
-
-    util_scale = float(cfg.get("utility_scale", 1.0))
-    utility_scaled = util_scale * utility
-    util_loss = -utility_scaled.mean()
-
-    total = w_tr * loss_trade + w_dr * loss_dir + w_ret * loss_ret + w_ut * util_loss
-
-    parts = {
-        "bce_trade": loss_trade.detach(),
-        "bce_dir": loss_dir.detach(),
-        "huber": loss_ret.detach(),
-        "util": utility.mean().detach(),
-        "util_scaled": utility_scaled.mean().detach(),
-        "util_loss": util_loss.detach(),
-        "pos_abs": torch.abs(pos).mean().detach(),
-        "p_trade_mean": p_trade.mean().detach(),
-    }
-    return total, parts
-
-# %%
-# ======================================================================
-# Step 9: Evaluation (two-head -> prob3 for thresholds, log AUCs + utility)
-# ======================================================================
 
 @torch.no_grad()
-def eval_twohead_on_indices(
+def predict_probs_on_indices(
     model: nn.Module,
     X_scaled: np.ndarray,
     edge_scaled: np.ndarray,
     indices: np.ndarray,
-    bce_trade: nn.Module,
-    bce_dir: nn.Module,
-    cfg: Dict[str, Any],
-) -> Dict[str, Any]:
-    ds = LobGraphSequenceDatasetTwoHeadFixedH(
-        X_node=X_scaled,
-        E_feat=edge_scaled,
-        y_trade_arr=y_trade,
-        y_dir_arr=y_dir,
-        exit_ret_arr=exit_ret,
-        fixed_ret_arr=fixed_ret,
-        sample_t_=sample_t,
-        indices=indices.astype(np.int64),
-        lookback=int(cfg["lookback"]),
-    )
-    loader = DataLoader(ds, batch_size=int(cfg["batch_size"]), shuffle=False, collate_fn=collate_fn_twohead, num_workers=0)
+    cfg: Dict[str, Any]
+) -> Tuple[np.ndarray, np.ndarray]:
+    ds = LobGraphSequenceDataset2Stage(X_scaled, edge_scaled, y_trade, y_dir, exit_ret, sample_t, indices, cfg["lookback"])
+    loader = DataLoader(ds, batch_size=int(cfg["batch_size"]), shuffle=False, collate_fn=collate_fn_2stage, num_workers=0)
 
     model.eval()
-
-    tot_loss = 0.0
-    tot_tr = 0.0
-    tot_dr = 0.0
-    tot_huber = 0.0
-    tot_util = 0.0
-    tot_util_s = 0.0
-    tot_pos_abs = 0.0
-    tot_ptr = 0.0
-    n = 0
-
-    p_trade_all = []
-    p_dir_all = []
-    y_trade_all = []
-    y_tb_all = []
-    exit_all = []
-
-    for x, e, yt, yd, er_exit, er_fixed, _sidx in loader:
+    probs = []
+    ers = []
+    for x, e, _yt, _yd, er in loader:
         x = x.to(DEVICE).float()
         e = e.to(DEVICE).float()
-        yt = yt.to(DEVICE).float()
-        yd = yd.to(DEVICE).float()
-        er_fixed = er_fixed.to(DEVICE).float()
+        logits = model(x, e, EDGE_INDEX.to(DEVICE), cfg=cfg, return_aux=False)
+        p = torch.softmax(logits, dim=-1).cpu().numpy()
+        probs.append(p)
+        ers.append(er.cpu().numpy())
 
-        trade_logit, dir_logit, fixed_hat, aux = model(x, e, return_aux=True)
-        loss, parts = multitask_loss_twohead_fixedH(trade_logit, dir_logit, fixed_hat, yt, yd, er_fixed, bce_trade, bce_dir, cfg)
-        loss = total_loss_with_adj_reg(loss, aux, cfg)
+    return np.concatenate(probs, axis=0), np.concatenate(ers, axis=0)
 
-        B = int(yt.size(0))
-        tot_loss += float(loss.item()) * B
-        tot_tr += float(parts["bce_trade"].item()) * B
-        tot_dr += float(parts["bce_dir"].item()) * B
-        tot_huber += float(parts["huber"].item()) * B
-        tot_util += float(parts["util"].item()) * B
-        tot_util_s += float(parts["util_scaled"].item()) * B
-        tot_pos_abs += float(parts["pos_abs"].item()) * B
-        tot_ptr += float(parts["p_trade_mean"].item()) * B
-        n += B
 
-        p_trade = torch.sigmoid(trade_logit).detach().cpu().numpy()
-        p_dir = torch.sigmoid(dir_logit).detach().cpu().numpy()
-
-        p_trade_all.append(p_trade)
-        p_dir_all.append(p_dir)
-
-        y_trade_all.append(yt.detach().cpu().numpy())
-
-        # TB label reconstructed from y_trade/y_dir is not possible for flat; keep original via index
-        # Here we recover TB labels by mapping sidx->t->y_tb outside the loader:
-        # We use exit_ret tensor order and dataset indices; easiest: compute y_tb in dataset using sample_t.
-        # To keep eval simple, recompute y_tb from current indices and loader batch positions:
-        # We'll store TB labels from dataset inside the batch by reconstructing using sidx in the dataset.
-        # (Here we hack: use er_exit length to slice TB labels by advancing pointer.)
-        # Instead, we do an exact method by re-evaluating TB labels from the same indices outside loop later.
-        exit_all.append(er_exit.detach().cpu().numpy())
-
-    p_trade_np = np.concatenate(p_trade_all, axis=0) if p_trade_all else np.zeros((0,), dtype=np.float64)
-    p_dir_np = np.concatenate(p_dir_all, axis=0) if p_dir_all else np.zeros((0,), dtype=np.float64)
-    y_trade_np = (np.concatenate(y_trade_all, axis=0) > 0.5).astype(np.int64) if y_trade_all else np.zeros((0,), dtype=np.int64)
-    er_exit_np = np.concatenate(exit_all, axis=0) if exit_all else np.zeros((0,), dtype=np.float64)
-
-    # Exact TB labels for these indices:
-    t_idx = sample_t[indices.astype(np.int64)]
-    y_tb_np = y_tb[t_idx].astype(np.int64)
-
-    trade_auc, dir_auc = compute_trade_dir_auc_from_twohead(y_trade_np, y_tb_np, p_trade_np, p_dir_np)
-
-    prob3 = probs3_from_twohead(p_trade_np, p_dir_np)
-
-    out = {
-        "loss": float(tot_loss / max(1, n)),
-        "loss_trade": float(tot_tr / max(1, n)),
-        "loss_dir": float(tot_dr / max(1, n)),
-        "loss_huber": float(tot_huber / max(1, n)),
-        "soft_util_mean": float(tot_util / max(1, n)),
-        "soft_util_scaled_mean": float(tot_util_s / max(1, n)),
-        "pos_abs_mean": float(tot_pos_abs / max(1, n)),
-        "p_trade_mean": float(tot_ptr / max(1, n)),
-        "trade_auc": float(trade_auc) if np.isfinite(trade_auc) else float("nan"),
-        "dir_auc": float(dir_auc) if np.isfinite(dir_auc) else float("nan"),
-        "p_trade": p_trade_np,
-        "p_dir": p_dir_np,
-        "prob3": prob3,
-        "y_tb": y_tb_np,
-        "exit_ret": er_exit_np,
-    }
-    return out
+# %% [markdown]
+# ## Step 10 — Run walk-forward folds (CV-part) + store fold artifacts + SAVE bundles (NEW)
 
 # %%
-# ======================================================================
-# Step 10: Artifact saving/loading (weights .pt + scaler .npz + meta .json)
-# ======================================================================
-
-def _to_jsonable_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    out = {}
-    for k, v in cfg.items():
-        out[k] = str(v) if isinstance(v, Path) else v
-    return out
+def _state_dict_to_cpu(sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    return {k: v.detach().cpu().clone() for k, v in sd.items()}
 
 
-def save_scaler_npz(path: Path, params: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        str(path),
-        center_=np.asarray(params["center_"], dtype=np.float32),
-        scale_=np.asarray(params["scale_"], dtype=np.float32),
-        max_abs=np.asarray([float(params["max_abs"])], dtype=np.float32),
-    )
-
-
-def load_scaler_npz(path: Path) -> Dict[str, Any]:
-    data = np.load(str(path))
-    return {
-        "center_": data["center_"].astype(np.float32),
-        "scale_": data["scale_"].astype(np.float32),
-        "max_abs": float(data["max_abs"][0]),
-    }
-
-
-def save_bundle(
-    bundle_dir: Path,
-    name: str,
-    model_state: Dict[str, torch.Tensor],
-    cfg: Dict[str, Any],
-    node_scaler_params: Dict[str, Any],
-    edge_scaler_params: Optional[Dict[str, Any]],
-    extra_meta: Dict[str, Any],
-) -> Dict[str, Path]:
-    bundle_dir.mkdir(parents=True, exist_ok=True)
-    weights_path = bundle_dir / f"{name}_weights.pt"
-    node_scaler_path = bundle_dir / f"{name}_node_scaler.npz"
-    edge_scaler_path = bundle_dir / f"{name}_edge_scaler.npz"
-    meta_path = bundle_dir / f"{name}_meta.json"
-
-    torch.save(model_state, str(weights_path))
-
-    save_scaler_npz(node_scaler_path, node_scaler_params)
-    edge_scaler_file = None
-    if edge_scaler_params is not None:
-        save_scaler_npz(edge_scaler_path, edge_scaler_params)
-        edge_scaler_file = edge_scaler_path.name
-
-    meta = {
-        "name": name,
-        "weights_file": weights_path.name,
-        "node_scaler_file": node_scaler_path.name,
-        "edge_scaler_file": edge_scaler_file,
-        "cfg": _to_jsonable_cfg(cfg),
-        **extra_meta,
-    }
-    with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2)
-
-    return {
-        "weights": weights_path,
-        "node_scaler": node_scaler_path,
-        "edge_scaler": edge_scaler_path if edge_scaler_params is not None else None,
-        "meta": meta_path,
-    }
-
-
-def load_bundle(bundle_dir: Path, name: str) -> Dict[str, Any]:
-    meta_path = bundle_dir / f"{name}_meta.json"
-    if not meta_path.exists():
-        raise FileNotFoundError(str(meta_path))
-
-    with open(meta_path, "r", encoding="utf-8") as f:
-        meta = json.load(f)
-
-    weights_path = bundle_dir / meta["weights_file"]
-    node_scaler_path = bundle_dir / meta["node_scaler_file"]
-    edge_scaler_file = meta.get("edge_scaler_file", None)
-    edge_scaler_path = (bundle_dir / edge_scaler_file) if edge_scaler_file else None
-
-    state = torch.load(str(weights_path), map_location="cpu", weights_only=True)
-    node_scaler_params = load_scaler_npz(node_scaler_path)
-    edge_scaler_params = load_scaler_npz(edge_scaler_path) if edge_scaler_path else None
-
-    return {
-        "meta": meta,
-        "state": state,
-        "node_scaler_params": node_scaler_params,
-        "edge_scaler_params": edge_scaler_params,
-    }
-
-# %%
-# ======================================================================
-# Step 11: Train one fold (two-head)
-# Selection metric: sel = soft_util_scaled_mean + b * dir_auc
-# Still log trade_auc and dir_auc each epoch
-# ======================================================================
-
-def train_one_fold_twohead_fixedH(
-    fold_id: int,
-    X_scaled: np.ndarray,
-    edge_scaled: np.ndarray,
-    idx_train: np.ndarray,
-    idx_val: np.ndarray,
-    idx_test: np.ndarray,
-    node_scaler_params: Dict[str, Any],
-    edge_scaler_params: Optional[Dict[str, Any]],
-    cfg: Dict[str, Any],
-) -> Dict[str, Any]:
-    t_train = sample_t[idx_train]
-    ytr_train = y_trade[t_train].astype(np.int64)
-    ytb_train = y_tb[t_train].astype(np.int64)
-
-    tr_ds = LobGraphSequenceDatasetTwoHeadFixedH(X_scaled, edge_scaled, y_trade, y_dir, exit_ret, fixed_ret, sample_t, idx_train, int(cfg["lookback"]))
-    va_ds = LobGraphSequenceDatasetTwoHeadFixedH(X_scaled, edge_scaled, y_trade, y_dir, exit_ret, fixed_ret, sample_t, idx_val,   int(cfg["lookback"]))
-    te_ds = LobGraphSequenceDatasetTwoHeadFixedH(X_scaled, edge_scaled, y_trade, y_dir, exit_ret, fixed_ret, sample_t, idx_test,  int(cfg["lookback"]))
-
-    sampler = None
-    shuffle = True
-    if bool(cfg.get("use_weighted_sampler", True)):
-        sampler = make_weighted_sampler_trade(ytr_train)
-        shuffle = False
-
-    tr_loader = DataLoader(tr_ds, batch_size=int(cfg["batch_size"]), shuffle=shuffle, sampler=sampler, collate_fn=collate_fn_twohead, num_workers=0)
-    va_loader = DataLoader(va_ds, batch_size=int(cfg["batch_size"]), shuffle=False, collate_fn=collate_fn_twohead, num_workers=0)
-    te_loader = DataLoader(te_ds, batch_size=int(cfg["batch_size"]), shuffle=False, collate_fn=collate_fn_twohead, num_workers=0)
-
-    model = GraphWaveNetTwoHeadFixedH(
-        node_in=int(X_scaled.shape[-1]),
-        edge_dim=int(edge_scaled.shape[-1]),
-        cfg=cfg,
-        n_nodes=len(ASSETS),
-        target_node=TARGET_NODE,
-    ).to(DEVICE)
-
-    # BCE losses with pos_weight for class imbalance
-    pos_w_trade = compute_pos_weights_binary(ytr_train)
-    bce_trade = nn.BCEWithLogitsLoss(pos_weight=pos_w_trade)
-
-    # Direction pos_weight computed on trade samples only
-    mask_tr = (ytb_train != 1)
-    ydir_train = (ytb_train[mask_tr] == 2).astype(np.int64)
-    pos_w_dir = compute_pos_weights_binary(ydir_train) if ydir_train.size else torch.tensor([1.0], device=DEVICE)
-    bce_dir = nn.BCEWithLogitsLoss(pos_weight=pos_w_dir)
-
-    opt = torch.optim.AdamW(model.parameters(), lr=float(cfg["lr"]), weight_decay=float(cfg["weight_decay"]))
-
-    use_onecycle = bool(cfg.get("use_onecycle", True))
-    if use_onecycle:
-        sch = torch.optim.lr_scheduler.OneCycleLR(
-            opt,
-            max_lr=float(cfg["lr"]),
-            epochs=int(cfg["epochs"]),
-            steps_per_epoch=max(1, len(tr_loader)),
-            pct_start=0.15,
-            div_factor=10.0,
-            final_div_factor=50.0,
-        )
-    else:
-        sch = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="max", factor=0.5, patience=3)
-
-    b_dir = float(cfg.get("sel_b_dir_auc", 0.10))
-    trade_pen = float(cfg.get("trade_prob_penalty", 0.0))
-
-    best_sel = -1e18
-    best_state = None
-    best_epoch = -1
-    patience = 7
-    bad = 0
-
-    for ep in range(1, int(cfg["epochs"]) + 1):
-        model.train()
-
-        tot = 0.0
-        tot_tr = 0.0
-        tot_dr = 0.0
-        tot_h = 0.0
-        tot_u = 0.0
-        tot_us = 0.0
-        n = 0
-
-        for x, e, yt, yd, _er_exit, er_fixed, _sidx in tr_loader:
-            x = x.to(DEVICE).float()
-            e = e.to(DEVICE).float()
-            yt = yt.to(DEVICE).float()
-            yd = yd.to(DEVICE).float()
-            er_fixed = er_fixed.to(DEVICE).float()
-
-            opt.zero_grad(set_to_none=True)
-
-            trade_logit, dir_logit, fixed_hat, aux = model(x, e, return_aux=True)
-            loss_mt, parts = multitask_loss_twohead_fixedH(
-                trade_logit, dir_logit, fixed_hat,
-                yt, yd, er_fixed,
-                bce_trade, bce_dir,
-                cfg
-            )
-
-            if trade_pen > 0:
-                loss_mt = loss_mt + trade_pen * parts["p_trade_mean"]
-
-            loss = total_loss_with_adj_reg(loss_mt, aux, cfg)
-            if not torch.isfinite(loss):
-                continue
-
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), float(cfg["grad_clip"]))
-            opt.step()
-            if use_onecycle:
-                sch.step()
-
-            B = int(yt.size(0))
-            tot += float(loss.item()) * B
-            tot_tr += float(parts["bce_trade"].item()) * B
-            tot_dr += float(parts["bce_dir"].item()) * B
-            tot_h += float(parts["huber"].item()) * B
-            tot_u += float(parts["util"].item()) * B
-            tot_us += float(parts["util_scaled"].item()) * B
-            n += B
-
-        tr_loss = tot / max(1, n)
-        tr_tr = tot_tr / max(1, n)
-        tr_dr = tot_dr / max(1, n)
-        tr_h = tot_h / max(1, n)
-        tr_u = tot_u / max(1, n)
-        tr_us = tot_us / max(1, n)
-
-        # Validation
-        model.eval()
-        v_tot = 0.0
-        v_tr = 0.0
-        v_dr = 0.0
-        v_h = 0.0
-        v_u = 0.0
-        v_us = 0.0
-        v_pa = 0.0
-        v_ptr = 0.0
-        v_n = 0
-
-        p_trade_list = []
-        p_dir_list = []
-        y_trade_list = []
-        exit_list = []
-
-        for x, e, yt, yd, er_exit, er_fixed, _sidx in va_loader:
-            x = x.to(DEVICE).float()
-            e = e.to(DEVICE).float()
-            yt = yt.to(DEVICE).float()
-            yd = yd.to(DEVICE).float()
-            er_fixed = er_fixed.to(DEVICE).float()
-
-            trade_logit, dir_logit, fixed_hat, aux = model(x, e, return_aux=True)
-            loss_mt, parts = multitask_loss_twohead_fixedH(
-                trade_logit, dir_logit, fixed_hat,
-                yt, yd, er_fixed,
-                bce_trade, bce_dir,
-                cfg
-            )
-            loss_val = total_loss_with_adj_reg(loss_mt, aux, cfg)
-
-            B = int(yt.size(0))
-            v_tot += float(loss_val.item()) * B
-            v_tr += float(parts["bce_trade"].item()) * B
-            v_dr += float(parts["bce_dir"].item()) * B
-            v_h += float(parts["huber"].item()) * B
-            v_u += float(parts["util"].item()) * B
-            v_us += float(parts["util_scaled"].item()) * B
-            v_pa += float(parts["pos_abs"].item()) * B
-            v_ptr += float(parts["p_trade_mean"].item()) * B
-            v_n += B
-
-            p_trade_list.append(torch.sigmoid(trade_logit).detach().cpu().numpy())
-            p_dir_list.append(torch.sigmoid(dir_logit).detach().cpu().numpy())
-            y_trade_list.append((yt.detach().cpu().numpy() > 0.5).astype(np.int64))
-            exit_list.append(er_exit.detach().cpu().numpy())
-
-        p_trade_np = np.concatenate(p_trade_list, axis=0) if p_trade_list else np.zeros((0,), dtype=np.float64)
-        p_dir_np = np.concatenate(p_dir_list, axis=0) if p_dir_list else np.zeros((0,), dtype=np.float64)
-        y_trade_np = np.concatenate(y_trade_list, axis=0) if y_trade_list else np.zeros((0,), dtype=np.int64)
-        er_exit_np = np.concatenate(exit_list, axis=0) if exit_list else np.zeros((0,), dtype=np.float64)
-
-        t_val = sample_t[idx_val]
-        y_tb_val = y_tb[t_val].astype(np.int64)
-        trade_auc, dir_auc = compute_trade_dir_auc_from_twohead(y_trade_np, y_tb_val, p_trade_np, p_dir_np)
-
-        val_loss = v_tot / max(1, v_n)
-        val_tr = v_tr / max(1, v_n)
-        val_dr = v_dr / max(1, v_n)
-        val_h = v_h / max(1, v_n)
-        val_u = v_u / max(1, v_n)
-        val_us = v_us / max(1, v_n)
-        val_pa = v_pa / max(1, v_n)
-        val_ptr = v_ptr / max(1, v_n)
-
-        sel = float(val_us) + b_dir * (float(dir_auc) if np.isfinite(dir_auc) else 0.0)
-
-        if sel > best_sel:
-            best_sel = sel
-            best_epoch = ep
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            bad = 0
-        else:
-            bad += 1
-
-        if not use_onecycle:
-            sch.step(sel)
-
-        lr_now = opt.param_groups[0]["lr"]
-        w_support = model.support_mix().detach().cpu().numpy().tolist()
-
-        print(
-            f"[fold {fold_id:02d}] ep {ep:02d} lr={lr_now:.2e} "
-            f"tr_loss={tr_loss:.4f} (bceT={tr_tr:.4f}, bceD={tr_dr:.4f}, huber={tr_h:.4f}, util={tr_u:.5f}, utilS={tr_us:.5f}) "
-            f"val_loss={val_loss:.4f} (bceT={val_tr:.4f}, bceD={val_dr:.4f}, huber={val_h:.4f}, util={val_u:.5f}, utilS={val_us:.5f}, posAbs={val_pa:.3f}, pT={val_ptr:.3f}) "
-            f"val_trade_auc={trade_auc:.3f} val_dir_auc={dir_auc:.3f} sel={sel:.5f} "
-            f"best={best_sel:.5f}@ep{best_epoch:02d} supports={np.round(w_support, 3).tolist()}"
-        )
-
-        if bad >= patience:
-            break
-
-    if best_state is not None:
-        model.load_state_dict(best_state)
-
-    # Eval with best epoch model
-    val_eval = eval_twohead_on_indices(model, X_scaled, edge_scaled, idx_val, bce_trade, bce_dir, cfg)
-    test_eval = eval_twohead_on_indices(model, X_scaled, edge_scaled, idx_test, bce_trade, bce_dir, cfg)
-
-    true_val_trade_rate = split_trade_ratio(idx_val, sample_t, y_trade)
-    sweep_val = sweep_thresholds_3class(
-        prob3=val_eval["prob3"],
-        exit_ret_arr=val_eval["exit_ret"],
-        cfg=cfg,
-        min_trades=int(cfg["eval_min_trades"]),
-        target_trade_rate=float(true_val_trade_rate),
-    )
-    best_thr = sweep_val.iloc[0].to_dict()
-    thr_trade = float(best_thr["thr_trade"])
-    thr_dir = float(best_thr["thr_dir"])
-
-    pnl_val = pnl_from_probs_3class(val_eval["prob3"], val_eval["exit_ret"], thr_trade, thr_dir, cfg["cost_bps"])
-    pnl_test = pnl_from_probs_3class(test_eval["prob3"], test_eval["exit_ret"], thr_trade, thr_dir, cfg["cost_bps"])
-
-    print(
-        f"[fold {fold_id:02d}] chosen thresholds on VAL: thr_trade={thr_trade:.3f} thr_dir={thr_dir:.3f} "
-        f"| val pnl_sum={pnl_val['pnl_sum']:.4f} val trade_rate={pnl_val['trade_rate']:.3f}"
-    )
-    print(
-        f"[fold {fold_id:02d}] TEST (fixed thresholds from VAL): "
-        f"trade_auc={test_eval['trade_auc']:.3f} dir_auc={test_eval['dir_auc']:.3f} "
-        f"soft_utilS={test_eval['soft_util_scaled_mean']:.5f} pnl_sum={pnl_test['pnl_sum']:.4f} "
-        f"trade_rate={pnl_test['trade_rate']:.3f} trades={pnl_test['n_trades']}"
-    )
-
-    return {
-        "fold": int(fold_id),
-        "model_state": {k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
-        "node_scaler_params": node_scaler_params,
-        "edge_scaler_params": edge_scaler_params,
-        "idx_train": idx_train,
-        "idx_val": idx_val,
-        "idx_test": idx_test,
-        "best_epoch": int(best_epoch),
-        "best_sel": float(best_sel),
-        "val_eval": val_eval,
-        "test_eval": test_eval,
-        "thr_trade": thr_trade,
-        "thr_dir": thr_dir,
-        "pnl_val": pnl_val,
-        "pnl_test": pnl_test,
-    }
-
-# %%
-# ======================================================================
-# Step 12: Walk-forward CV run + saving per-fold bundles + overall best
-# ======================================================================
-
-def run_walk_forward_cv_twohead_fixedH() -> Tuple[pd.DataFrame, List[Dict[str, Any]], str]:
-    fold_artifacts: List[Dict[str, Any]] = []
+def run_walk_forward_cv() -> Tuple[pd.DataFrame, List[Dict[str, Any]], nn.Module, nn.Module]:
+    """
+    Returns:
+      - cv_summary: per-fold TEST metrics (using thresholds selected on that fold VAL)
+      - fold_artifacts: list of per-fold dicts (models + thresholds + VAL preds + scaler params)
+      - m_trade_last, m_dir_last: last fold trained models
+    """
     rows: List[Dict[str, Any]] = []
+    fold_artifacts: List[Dict[str, Any]] = []
 
-    best_overall_sel = -1e18
-    best_overall_name = None
+    m_trade_last: Optional[nn.Module] = None
+    m_dir_last: Optional[nn.Module] = None
+
+    # root run dir for this execution
+    run_root = Path(CFG["bundle_dir"]) / str(CFG.get("run_name", "run"))
+    run_root.mkdir(parents=True, exist_ok=True)
 
     for fi, (idx_tr, idx_va, idx_te) in enumerate(walk_splits, 1):
-        print("\n" + "=" * 90)
+        print("\n" + "=" * 80)
         print(f"FOLD {fi}/{len(walk_splits)} sizes: train={len(idx_tr)} val={len(idx_va)} test={len(idx_te)}")
-        print(f"True trade ratio (val):  {split_trade_ratio(idx_va, sample_t, y_trade):.3f}")
-        print(f"True trade ratio (test): {split_trade_ratio(idx_te, sample_t, y_trade):.3f}")
+        true_val_trade = split_trade_ratio(idx_va, sample_t, y_trade)
+        true_te_trade = split_trade_ratio(idx_te, sample_t, y_trade)
+        print(f"True trade ratio (val):  {true_val_trade:.3f}")
+        print(f"True trade ratio (test): {true_te_trade:.3f}")
 
-        X_scaled, node_params = fit_scale_nodes_train_only(X_node_raw, sample_t, idx_tr, max_abs=float(CFG["max_abs_feat"]))
+        # fold scaling (fit only on fold train timeline)
+        X_scaled, node_scaler = fit_scale_nodes_train_only(X_node_raw, sample_t, idx_tr, max_abs=CFG["max_abs_feat"])
+        node_scaler_params = robust_scaler_to_params(node_scaler)
+
         if bool(CFG.get("edge_scale", True)):
-            edge_scaled, edge_params = fit_scale_edges_train_only(edge_feat, sample_t, idx_tr, max_abs=float(CFG["max_abs_edge"]))
+            edge_scaled, edge_scaler = fit_scale_edges_train_only(edge_feat, sample_t, idx_tr, max_abs=CFG["max_abs_edge"])
+            edge_scaler_params: Optional[Dict[str, Any]] = robust_scaler_to_params(edge_scaler)
         else:
-            edge_scaled = edge_feat.astype(np.float32)
-            edge_params = None
+            edge_scaled = edge_feat
+            edge_scaler_params = None
 
-        artifact = train_one_fold_twohead_fixedH(
-            fold_id=fi,
-            X_scaled=X_scaled,
-            edge_scaled=edge_scaled,
-            idx_train=idx_tr,
-            idx_val=idx_va,
-            idx_test=idx_te,
-            node_scaler_params=node_params,
-            edge_scaler_params=edge_params,
-            cfg=CFG,
+        # Stage A
+        m_trade, r_trade = train_binary_classifier(
+            X_scaled, edge_scaled, y_trade, y_dir, exit_ret, sample_t,
+            idx_tr, idx_va, idx_te, CFG, stage_name="trade"
         )
 
-        fold_name = f"fold_{fi:02d}"
-        extra_meta = {
-            "kind": "fold_best",
+        # Stage B (trade-only indices)
+        idx_tr_T = subset_trade_indices(idx_tr, sample_t, y_trade)
+        idx_va_T = subset_trade_indices(idx_va, sample_t, y_trade)
+        idx_te_T = subset_trade_indices(idx_te, sample_t, y_trade)
+
+        fold_dir_trained = True
+        thr_trade_star = float("nan")
+        thr_dir_star = float("nan")
+        best_val_score = float("nan")
+
+        prob_trade_val = None
+        prob_dir_val = None
+        er_val = None
+
+        if len(idx_tr_T) < max(200, 2 * CFG["batch_size"]) or len(idx_va_T) < 50 or len(idx_te_T) < 50:
+            print("[dir] skip: not enough trade samples in this fold.")
+            fold_dir_trained = False
+            m_dir = None
+
+            rows.append({
+                "fold": fi,
+                "trade_test_auc": r_trade["test"]["auc"],
+                "dir_test_auc": np.nan,
+                "test_trade_rate_pred": np.nan,
+                "test_pnl_sum": np.nan,
+                "test_pnl_mean": np.nan,
+                "thr_trade": np.nan,
+                "thr_dir": np.nan,
+                "n_trades": np.nan,
+                "best_val_score": np.nan,
+            })
+        else:
+            m_dir, r_dir = train_binary_classifier(
+                X_scaled, edge_scaled, y_trade, y_dir, exit_ret, sample_t,
+                idx_tr_T, idx_va_T, idx_te_T, CFG, stage_name="dir"
+            )
+
+            # Choose thresholds on VAL (VAL only)
+            prob_trade_val, er_val = predict_probs_on_indices(m_trade, X_scaled, edge_scaled, idx_va, CFG)
+            prob_dir_val, _ = predict_probs_on_indices(m_dir, X_scaled, edge_scaled, idx_va, CFG)
+
+            sweep_val = sweep_thresholds(
+                prob_trade_val, prob_dir_val, er_val, CFG,
+                min_trades=int(CFG["eval_min_trades"]),
+                target_trade_rate=float(true_val_trade),
+            )
+            best_val = sweep_val.iloc[0].to_dict()
+            thr_trade_star = float(best_val["thr_trade"])
+            thr_dir_star = float(best_val["thr_dir"])
+            best_val_score = float(best_val["score"])
+
+            val_metrics = two_stage_pnl_by_threshold(prob_trade_val, prob_dir_val, er_val, thr_trade_star, thr_dir_star, CFG["cost_bps"])
+            print("\nChosen thresholds (from VAL):")
+            print(f"  thr_trade*={thr_trade_star:.3f} thr_dir*={thr_dir_star:.3f} | score={best_val['score']:.4f}")
+            print(f"  val trade_rate(pred)={val_metrics['trade_rate']:.3f} | val pnl_sum={val_metrics['pnl_sum']:.4f} | val sharpe={val_metrics['pnl_sharpe']:.3f}")
+
+            print("\nTop-5 VAL threshold candidates:")
+            print(sweep_val.head(5)[["thr_trade", "thr_dir", "score", "trade_rate", "pnl_sum", "pnl_sharpe", "n_trades"]])
+
+            # Evaluate on TEST with fixed thresholds
+            prob_trade_te, er_te = predict_probs_on_indices(m_trade, X_scaled, edge_scaled, idx_te, CFG)
+            prob_dir_te, _ = predict_probs_on_indices(m_dir, X_scaled, edge_scaled, idx_te, CFG)
+            te_metrics = two_stage_pnl_by_threshold(prob_trade_te, prob_dir_te, er_te, thr_trade_star, thr_dir_star, CFG["cost_bps"])
+
+            print("\nTEST (fixed thr from VAL):")
+            print(f"  trade_rate(pred)={te_metrics['trade_rate']:.3f} | pnl_sum={te_metrics['pnl_sum']:.4f} | pnl_mean={te_metrics['pnl_mean']:.6f} | trades={te_metrics['n_trades']}")
+
+            rows.append({
+                "fold": fi,
+                "trade_test_auc": r_trade["test"]["auc"],
+                "dir_test_auc": r_dir["test"]["auc"],
+                "test_trade_rate_pred": te_metrics["trade_rate"],
+                "test_pnl_sum": te_metrics["pnl_sum"],
+                "test_pnl_mean": te_metrics["pnl_mean"],
+                "thr_trade": thr_trade_star,
+                "thr_dir": thr_dir_star,
+                "n_trades": te_metrics["n_trades"],
+                "best_val_score": best_val_score,
+            })
+
+        # store artifact dict (in-memory)
+        fold_artifacts.append({
             "fold": fi,
-            "best_epoch": artifact["best_epoch"],
-            "best_sel": artifact["best_sel"],
-            "thr_trade": artifact["thr_trade"],
-            "thr_dir": artifact["thr_dir"],
-            "idx_train": artifact["idx_train"].tolist(),
-            "idx_val": artifact["idx_val"].tolist(),
-            "idx_test": artifact["idx_test"].tolist(),
-        }
-        saved = save_bundle(
-            bundle_dir=ART_DIR,
-            name=fold_name,
-            model_state=artifact["model_state"],
-            cfg=CFG,
-            node_scaler_params=artifact["node_scaler_params"],
-            edge_scaler_params=artifact["edge_scaler_params"],
-            extra_meta=extra_meta,
-        )
-        print("Saved fold bundle:", saved["meta"].name)
-
-        if float(artifact["best_sel"]) > best_overall_sel:
-            best_overall_sel = float(artifact["best_sel"])
-            best_overall_name = fold_name
-
-        fold_artifacts.append(artifact)
-
-        rows.append({
-            "fold": fi,
-            "val_trade_auc": artifact["val_eval"]["trade_auc"],
-            "val_dir_auc": artifact["val_eval"]["dir_auc"],
-            "val_soft_utilS": artifact["val_eval"]["soft_util_scaled_mean"],
-            "val_loss": artifact["val_eval"]["loss"],
-            "test_trade_auc": artifact["test_eval"]["trade_auc"],
-            "test_dir_auc": artifact["test_eval"]["dir_auc"],
-            "test_soft_utilS": artifact["test_eval"]["soft_util_scaled_mean"],
-            "test_loss": artifact["test_eval"]["loss"],
-            "thr_trade": artifact["thr_trade"],
-            "thr_dir": artifact["thr_dir"],
-            "test_trade_rate_pred": artifact["pnl_test"]["trade_rate"],
-            "test_pnl_sum": artifact["pnl_test"]["pnl_sum"],
-            "test_n_trades": artifact["pnl_test"]["n_trades"],
-            "best_sel": artifact["best_sel"],
+            "idx_tr": idx_tr, "idx_va": idx_va, "idx_te": idx_te,
+            "thr_trade": thr_trade_star, "thr_dir": thr_dir_star,
+            "best_val_score": best_val_score,
+            "trade_state": _state_dict_to_cpu(m_trade.state_dict()),
+            "dir_state": _state_dict_to_cpu(m_dir.state_dict()) if fold_dir_trained else None,
+            "prob_trade_val": prob_trade_val,
+            "prob_dir_val": prob_dir_val,
+            "er_val": er_val,
+            "val_true_trade_rate": float(true_val_trade),
+            # NEW: store scaler params so we can save/load properly
+            "node_scaler_params": node_scaler_params,
+            "edge_scaler_params": edge_scaler_params,
         })
 
+        # NEW: save bundles to disk (per fold)
+        fold_dir = run_root / f"fold_{fi:02d}"
+        extra_common = {
+            "seed": int(SEED),
+            "fold": int(fi),
+            "assets": list(ASSETS),
+            "target_asset": str(TARGET_ASSET),
+            "target_node": int(TARGET_NODE),
+            "thr_trade": float(thr_trade_star) if np.isfinite(thr_trade_star) else None,
+            "thr_dir": float(thr_dir_star) if np.isfinite(thr_dir_star) else None,
+            "best_val_score": float(best_val_score) if np.isfinite(best_val_score) else None,
+            "val_true_trade_rate": float(true_val_trade) if np.isfinite(true_val_trade) else None,
+        }
+        save_bundle(
+            bundle_dir=fold_dir,
+            name="trade",
+            model_state=_state_dict_to_cpu(m_trade.state_dict()),
+            cfg=CFG,
+            node_scaler_params=node_scaler_params,
+            edge_scaler_params=edge_scaler_params,
+            extra_meta={**extra_common, "stage": "trade"},
+        )
+        if fold_dir_trained and m_dir is not None:
+            save_bundle(
+                bundle_dir=fold_dir,
+                name="dir",
+                model_state=_state_dict_to_cpu(m_dir.state_dict()),
+                cfg=CFG,
+                node_scaler_params=node_scaler_params,
+                edge_scaler_params=edge_scaler_params,
+                extra_meta={**extra_common, "stage": "dir"},
+            )
+
+        m_trade_last = m_trade
+        m_dir_last = m_dir if fold_dir_trained else None
+
+    if m_trade_last is None:
+        raise RuntimeError("No folds were trained; check your split configuration.")
+
     cv_summary = pd.DataFrame(rows)
-
-    assert best_overall_name is not None
-    overall_name = "overall_best"
-
-    best_bundle = load_bundle(ART_DIR, best_overall_name)
-    extra_meta = {
-        "kind": "overall_best",
-        "source_name": best_overall_name,
-        "source_fold": best_bundle["meta"].get("fold", None),
-        "thr_trade": best_bundle["meta"]["thr_trade"],
-        "thr_dir": best_bundle["meta"]["thr_dir"],
-        "idx_train": best_bundle["meta"]["idx_train"],
-        "idx_val": best_bundle["meta"]["idx_val"],
-        "idx_test": best_bundle["meta"]["idx_test"],
-    }
-    save_bundle(
-        bundle_dir=ART_DIR,
-        name=overall_name,
-        model_state=best_bundle["state"],
-        cfg=CFG,
-        node_scaler_params=best_bundle["node_scaler_params"],
-        edge_scaler_params=best_bundle["edge_scaler_params"],
-        extra_meta=extra_meta,
-    )
-    print("\nSaved overall best bundle as:", overall_name)
-
-    return cv_summary, fold_artifacts, overall_name
+    return cv_summary, fold_artifacts, m_trade_last, m_dir_last
 
 
-cv_summary_twohead, fold_artifacts_twohead, overall_best_name = run_walk_forward_cv_twohead_fixedH()
+cv_summary, fold_artifacts, m_trade_last, m_dir_last = run_walk_forward_cv()
 
-print("\n" + "=" * 90)
-print("CV summary (two-head; utility selection; TEST uses thresholds selected on VAL):")
-print(cv_summary_twohead)
-print("\nMeans:")
-print(cv_summary_twohead.mean(numeric_only=True))
+print("\n" + "=" * 80)
+print("CV summary (fold TEST, fixed thresholds from fold-VAL):")
+print(cv_summary)
+print("\nMeans (just for debugging, NOT a final decision rule):")
+print(cv_summary.mean(numeric_only=True))
+
+
+# %% [markdown]
+# ## Step 11 — Post-CV checks on FINAL holdout (10%) WITHOUT refit (3 methods)
 
 # %%
-# ======================================================================
-# Step 13: Evaluate a saved bundle on FINAL holdout
-# ======================================================================
+def _safe_auc_binary(y_true: np.ndarray, p1: np.ndarray) -> float:
+    y_true = np.asarray(y_true, dtype=np.int64)
+    p1 = np.asarray(p1, dtype=np.float64)
+    if y_true.size == 0 or len(np.unique(y_true)) < 2:
+        return float("nan")
+    return float(roc_auc_score(y_true, p1))
 
-@torch.no_grad()
-def evaluate_bundle_on_indices(bundle_dir: Path, name: str, indices: np.ndarray, label: str) -> Dict[str, Any]:
-    bundle = load_bundle(bundle_dir, name)
-    cfg = bundle["meta"]["cfg"]
 
-    model = GraphWaveNetTwoHeadFixedH(
-        node_in=int(X_node_raw.shape[-1]),
-        edge_dim=int(edge_feat.shape[-1]),
+def _build_model_from_state(node_in: int, edge_dim: int, cfg: Dict[str, Any], state: Dict[str, torch.Tensor]) -> nn.Module:
+    m = MTGNN_ConvAttn_Classifier(
+        node_in=node_in,
+        edge_dim=edge_dim,
         cfg=cfg,
         n_nodes=len(ASSETS),
         target_node=TARGET_NODE,
+        n_classes=2,
     ).to(DEVICE)
-    model.load_state_dict(bundle["state"])
-    model.eval()
+    m.load_state_dict(state)
+    m.eval()
+    return m
 
-    X_scaled = apply_scaler_params(X_node_raw.astype(np.float32), bundle["node_scaler_params"])
-    if bundle["edge_scaler_params"] is not None:
-        E_scaled = apply_scaler_params(edge_feat.astype(np.float32), bundle["edge_scaler_params"])
+
+def _get_scaled_arrays_from_params(node_scaler_params: Dict[str, Any], edge_scaler_params: Optional[Dict[str, Any]]) -> Tuple[np.ndarray, np.ndarray]:
+    X_scaled = apply_robust_scaler_params(X_node_raw, node_scaler_params, max_abs=CFG["max_abs_feat"])
+    if edge_scaler_params is None or not bool(CFG.get("edge_scale", True)):
+        E_scaled = edge_feat
     else:
-        E_scaled = edge_feat.astype(np.float32)
-
-    idx_train_saved = np.asarray(bundle["meta"]["idx_train"], dtype=np.int64)
-    t_train = sample_t[idx_train_saved]
-    ytr_train = y_trade[t_train].astype(np.int64)
-    ytb_train = y_tb[t_train].astype(np.int64)
-
-    pos_w_trade = compute_pos_weights_binary(ytr_train)
-    bce_trade = nn.BCEWithLogitsLoss(pos_weight=pos_w_trade)
-
-    mask_tr = (ytb_train != 1)
-    ydir_train = (ytb_train[mask_tr] == 2).astype(np.int64)
-    pos_w_dir = compute_pos_weights_binary(ydir_train) if ydir_train.size else torch.tensor([1.0], device=DEVICE)
-    bce_dir = nn.BCEWithLogitsLoss(pos_weight=pos_w_dir)
-
-    ev = eval_twohead_on_indices(model, X_scaled, E_scaled, indices.astype(np.int64), bce_trade, bce_dir, cfg)
-
-    thr_trade = float(bundle["meta"]["thr_trade"])
-    thr_dir = float(bundle["meta"]["thr_dir"])
-    pnl = pnl_from_probs_3class(ev["prob3"], ev["exit_ret"], thr_trade, thr_dir, float(cfg["cost_bps"]))
-
-    print("\n" + "=" * 90)
-    print(label)
-    print(f"bundle: {name}")
-    print(f"trade_auc={ev['trade_auc']:.3f} | dir_auc={ev['dir_auc']:.3f} | loss={ev['loss']:.4f}")
-    print(f"soft_util={ev['soft_util_mean']:.6f} | soft_utilS={ev['soft_util_scaled_mean']:.5f} | pos_abs={ev['pos_abs_mean']:.4f} | p_trade_mean={ev['p_trade_mean']:.3f}")
-    print(f"pnl_sum={pnl['pnl_sum']:.4f} | trade_rate={pnl['trade_rate']:.3f} | trades={pnl['n_trades']}")
-    return {"eval": ev, "pnl": pnl}
+        E_scaled = apply_robust_scaler_params(edge_feat, edge_scaler_params, max_abs=CFG["max_abs_edge"])
+    return X_scaled, E_scaled
 
 
-holdout_indices = idx_final_test.astype(np.int64)
-_ = evaluate_bundle_on_indices(ART_DIR, overall_best_name, holdout_indices, label="FINAL HOLDOUT (10%) using overall_best")
+def _eval_holdout_with_models_and_thresholds(
+    method: str,
+    m_trade: nn.Module,
+    m_dir: nn.Module,
+    thr_trade: float,
+    thr_dir: float,
+    X_scaled: np.ndarray,
+    edge_scaled: np.ndarray,
+    idx_holdout: np.ndarray,
+) -> Dict[str, Any]:
+    prob_trade_hold, er_hold = predict_probs_on_indices(m_trade, X_scaled, edge_scaled, idx_holdout, CFG)
+    prob_dir_hold, _ = predict_probs_on_indices(m_dir, X_scaled, edge_scaled, idx_holdout, CFG)
+
+    t_hold = sample_t[idx_holdout]
+    y_trade_hold = y_trade[t_hold].astype(np.int64)
+    y_dir_hold = y_dir[t_hold].astype(np.int64)
+
+    trade_auc = _safe_auc_binary(y_trade_hold, prob_trade_hold[:, 1])
+    mask_true_trade = (y_trade_hold == 1)
+    dir_auc = _safe_auc_binary(y_dir_hold[mask_true_trade], prob_dir_hold[mask_true_trade, 1])
+
+    pnl = two_stage_pnl_by_threshold(
+        prob_trade_hold, prob_dir_hold, er_hold,
+        thr_trade=thr_trade, thr_dir=thr_dir,
+        cost_bps=CFG["cost_bps"],
+    )
+
+    return {
+        "method": method,
+        "thr_trade": float(thr_trade),
+        "thr_dir": float(thr_dir),
+        "holdout_trade_auc": float(trade_auc) if np.isfinite(trade_auc) else np.nan,
+        "holdout_dir_auc": float(dir_auc) if np.isfinite(dir_auc) else np.nan,
+        "trade_rate_pred": float(pnl["trade_rate"]),
+        "pnl_sum": float(pnl["pnl_sum"]),
+        "pnl_sharpe": float(pnl["pnl_sharpe"]),
+        "n_trades": int(pnl["n_trades"]),
+    }
+
+
+def run_post_cv_holdout_checks() -> pd.DataFrame:
+    idx_holdout = idx_final_test.astype(np.int64)
+    node_in = int(X_node_raw.shape[-1])
+    edge_dim = int(edge_feat.shape[-1])
+
+    ok_folds = [fa for fa in fold_artifacts if fa.get("dir_state") is not None and np.isfinite(fa.get("thr_trade", np.nan))]
+    if len(ok_folds) == 0:
+        raise RuntimeError("No folds with a trained DIR model were stored; cannot run Step 11 checks.")
+
+    # 1) LAST fold model + LAST fold thresholds
+    fa_last = ok_folds[-1]
+    X_last, E_last = _get_scaled_arrays_from_params(fa_last["node_scaler_params"], fa_last["edge_scaler_params"])
+    m_trade_last_ = _build_model_from_state(node_in, edge_dim, CFG, fa_last["trade_state"])
+    m_dir_last_ = _build_model_from_state(node_in, edge_dim, CFG, fa_last["dir_state"])
+    r1 = _eval_holdout_with_models_and_thresholds(
+        method=f"1) LAST fold model + LAST fold thresholds (fold={fa_last['fold']})",
+        m_trade=m_trade_last_,
+        m_dir=m_dir_last_,
+        thr_trade=float(fa_last["thr_trade"]),
+        thr_dir=float(fa_last["thr_dir"]),
+        X_scaled=X_last,
+        edge_scaled=E_last,
+        idx_holdout=idx_holdout,
+    )
+
+    # 2) BEST-VAL fold model + BEST-VAL thresholds
+    fa_best = max(ok_folds, key=lambda d: float(d.get("best_val_score", -1e18)))
+    X_best, E_best = _get_scaled_arrays_from_params(fa_best["node_scaler_params"], fa_best["edge_scaler_params"])
+    m_trade_best = _build_model_from_state(node_in, edge_dim, CFG, fa_best["trade_state"])
+    m_dir_best = _build_model_from_state(node_in, edge_dim, CFG, fa_best["dir_state"])
+    r2 = _eval_holdout_with_models_and_thresholds(
+        method=f"2) BEST-VAL fold model + BEST-VAL thresholds (fold={fa_best['fold']}, val_score={fa_best['best_val_score']:.4f})",
+        m_trade=m_trade_best,
+        m_dir=m_dir_best,
+        thr_trade=float(fa_best["thr_trade"]),
+        thr_dir=float(fa_best["thr_dir"]),
+        X_scaled=X_best,
+        edge_scaled=E_best,
+        idx_holdout=idx_holdout,
+    )
+
+    # 3) LAST fold model + GLOBAL thresholds on concatenated fold-VAL predictions
+    prob_trade_all = np.concatenate([fa["prob_trade_val"] for fa in ok_folds], axis=0)
+    prob_dir_all = np.concatenate([fa["prob_dir_val"] for fa in ok_folds], axis=0)
+    er_all = np.concatenate([fa["er_val"] for fa in ok_folds], axis=0)
+
+    idx_va_all = np.concatenate([fa["idx_va"] for fa in ok_folds], axis=0)
+    true_trade_rate_all = split_trade_ratio(idx_va_all, sample_t, y_trade)
+
+    sweep_global = sweep_thresholds(
+        prob_trade_all, prob_dir_all, er_all, CFG,
+        min_trades=int(CFG["eval_min_trades"]),
+        target_trade_rate=float(true_trade_rate_all),
+    )
+    best_global = sweep_global.iloc[0].to_dict()
+    thr_trade_global = float(best_global["thr_trade"])
+    thr_dir_global = float(best_global["thr_dir"])
+
+    r3 = _eval_holdout_with_models_and_thresholds(
+        method=f"3) LAST fold model + GLOBAL thresholds (VAL-concat; true_val_trade={true_trade_rate_all:.3f}) (model_fold={fa_last['fold']})",
+        m_trade=m_trade_last_,
+        m_dir=m_dir_last_,
+        thr_trade=thr_trade_global,
+        thr_dir=thr_dir_global,
+        X_scaled=X_last,
+        edge_scaled=E_last,
+        idx_holdout=idx_holdout,
+    )
+
+    out = pd.DataFrame([r1, r2, r3])
+
+    print("\n" + "=" * 80)
+    print("STEP 11 — HOLDOUT CHECKS WITHOUT ANY REFIT (3 METHODS)")
+    print(f"Holdout size: {len(idx_holdout)} samples | sidx {int(idx_holdout[0])}..{int(idx_holdout[-1])}")
+
+    print("\nResults (compare these, not mean/median over folds):")
+    print(out[[
+        "method", "thr_trade", "thr_dir",
+        "holdout_trade_auc", "holdout_dir_auc",
+        "trade_rate_pred", "pnl_sum", "pnl_sharpe", "n_trades"
+    ]].to_string(index=False))
+
+    print("\nGlobal thresholds (method 3) top-5 candidates (VAL-concat):")
+    print(sweep_global.head(5)[["thr_trade", "thr_dir", "score", "trade_rate", "pnl_sum", "pnl_sharpe", "n_trades"]])
+
+    print("=" * 80)
+    return out
+
+
+post_cv_holdout = run_post_cv_holdout_checks()
+
+
+# %% [markdown]
+# ## Step 12 — Production-fit: train on CV(90%) → select thresholds on val_final → eval on FINAL holdout(10%) + SAVE bundles (NEW)
 
 # %%
-# ======================================================================
-# Step 14: Production fit on CV(90%) -> select thresholds on val_final -> eval holdout(10%)
-# ======================================================================
+def run_production_fit() -> Dict[str, Any]:
+    """
+    Train on the full CV-part (90%) with a final validation window (val_final),
+    select thresholds on val_final, then evaluate on FINAL holdout (10%).
+    Also saves production bundles to disk.
+    """
+    print("\n" + "=" * 80)
+    print("STEP 12 — PRODUCTION-FIT (TRAIN ON CV(90%) → SELECT THR ON val_final → EVAL ON FINAL HOLDOUT(10%))")
 
-def production_fit_and_save() -> str:
-    print("\n" + "=" * 90)
-    print("PRODUCTION FIT: train on CV(90%) -> select thresholds on val_final -> eval on FINAL holdout(10%)")
-
-    val_w = max(1, int(float(CFG["val_window_frac"]) * n_samples_cv))
+    val_w = max(1, int(CFG["val_window_frac"] * n_samples_cv))
     train_end = n_samples_cv - val_w
 
     idx_train_final = np.arange(0, train_end, dtype=np.int64)
     idx_val_final = np.arange(train_end, n_samples_cv, dtype=np.int64)
     idx_holdout = idx_final_test.astype(np.int64)
 
-    print("Sizes:")
+    true_val_trade = split_trade_ratio(idx_val_final, sample_t, y_trade)
+    true_hold_trade = split_trade_ratio(idx_holdout, sample_t, y_trade)
+
+    print("Final split sizes:")
     print("  train_final:", len(idx_train_final))
     print("  val_final  :", len(idx_val_final))
     print("  holdout    :", len(idx_holdout))
-    print(f"True trade ratio (val_final): {split_trade_ratio(idx_val_final, sample_t, y_trade):.3f}")
-    print(f"True trade ratio (holdout):   {split_trade_ratio(idx_holdout, sample_t, y_trade):.3f}")
+    print(f"True trade ratio (val_final): {true_val_trade:.3f}")
+    print(f"True trade ratio (holdout):   {true_hold_trade:.3f}")
 
-    X_scaled, node_params = fit_scale_nodes_train_only(X_node_raw, sample_t, idx_train_final, max_abs=float(CFG["max_abs_feat"]))
+    X_scaled_final, node_scaler = fit_scale_nodes_train_only(X_node_raw, sample_t, idx_train_final, max_abs=CFG["max_abs_feat"])
+    node_scaler_params = robust_scaler_to_params(node_scaler)
+
     if bool(CFG.get("edge_scale", True)):
-        edge_scaled, edge_params = fit_scale_edges_train_only(edge_feat, sample_t, idx_train_final, max_abs=float(CFG["max_abs_edge"]))
+        edge_scaled_final, edge_scaler = fit_scale_edges_train_only(edge_feat, sample_t, idx_train_final, max_abs=CFG["max_abs_edge"])
+        edge_scaler_params: Optional[Dict[str, Any]] = robust_scaler_to_params(edge_scaler)
     else:
-        edge_scaled = edge_feat.astype(np.float32)
-        edge_params = None
+        edge_scaled_final = edge_feat
+        edge_scaler_params = None
 
-    artifact = train_one_fold_twohead_fixedH(
-        fold_id=99,
-        X_scaled=X_scaled,
-        edge_scaled=edge_scaled,
-        idx_train=idx_train_final,
-        idx_val=idx_val_final,
-        idx_test=idx_holdout,
-        node_scaler_params=node_params,
-        edge_scaler_params=edge_params,
-        cfg=CFG,
+    # Stage A
+    m_trade_f, r_trade = train_binary_classifier(
+        X_scaled_final, edge_scaled_final, y_trade, y_dir, exit_ret, sample_t,
+        idx_train_final, idx_val_final, idx_holdout, CFG, stage_name="trade"
     )
 
-    prod_name = "production_best"
-    extra_meta = {
-        "kind": "production_best",
-        "fold": 99,
-        "best_epoch": artifact["best_epoch"],
-        "best_sel": artifact["best_sel"],
-        "thr_trade": artifact["thr_trade"],
-        "thr_dir": artifact["thr_dir"],
-        "idx_train": artifact["idx_train"].tolist(),
-        "idx_val": artifact["idx_val"].tolist(),
-        "idx_test": artifact["idx_test"].tolist(),
+    # Stage B (trade-only)
+    idx_train_T = subset_trade_indices(idx_train_final, sample_t, y_trade)
+    idx_val_T = subset_trade_indices(idx_val_final, sample_t, y_trade)
+    idx_hold_T = subset_trade_indices(idx_holdout, sample_t, y_trade)
+
+    print("\nTrade-only sizes for DIR:")
+    print("  train_final_T:", len(idx_train_T))
+    print("  val_final_T  :", len(idx_val_T))
+    print("  holdout_T    :", len(idx_hold_T))
+
+    if len(idx_train_T) < max(200, 2 * CFG["batch_size"]) or len(idx_val_T) < 50 or len(idx_hold_T) < 50:
+        raise RuntimeError("Not enough trade-only samples for DIR stage in production-fit.")
+
+    m_dir_f, r_dir = train_binary_classifier(
+        X_scaled_final, edge_scaled_final, y_trade, y_dir, exit_ret, sample_t,
+        idx_train_T, idx_val_T, idx_hold_T, CFG, stage_name="dir"
+    )
+
+    # thresholds on val_final
+    prob_trade_val, er_val = predict_probs_on_indices(m_trade_f, X_scaled_final, edge_scaled_final, idx_val_final, CFG)
+    prob_dir_val, _ = predict_probs_on_indices(m_dir_f, X_scaled_final, edge_scaled_final, idx_val_final, CFG)
+
+    sweep_val = sweep_thresholds(
+        prob_trade_val, prob_dir_val, er_val, CFG,
+        min_trades=int(CFG["eval_min_trades"]),
+        target_trade_rate=float(true_val_trade),
+    )
+    best_val = sweep_val.iloc[0].to_dict()
+    thr_trade_star = float(best_val["thr_trade"])
+    thr_dir_star = float(best_val["thr_dir"])
+
+    val_metrics = two_stage_pnl_by_threshold(prob_trade_val, prob_dir_val, er_val, thr_trade_star, thr_dir_star, CFG["cost_bps"])
+    print("\nChosen thresholds on val_final:")
+    print(f"  thr_trade*={thr_trade_star:.3f} thr_dir*={thr_dir_star:.3f} | score={best_val['score']:.4f}")
+    print(f"  val trade_rate(pred)={val_metrics['trade_rate']:.3f} | val pnl_sum={val_metrics['pnl_sum']:.4f} | val sharpe={val_metrics['pnl_sharpe']:.3f} | trades={val_metrics['n_trades']}")
+
+    # evaluate on holdout
+    prob_trade_hold, er_hold = predict_probs_on_indices(m_trade_f, X_scaled_final, edge_scaled_final, idx_holdout, CFG)
+    prob_dir_hold, _ = predict_probs_on_indices(m_dir_f, X_scaled_final, edge_scaled_final, idx_holdout, CFG)
+
+    t_hold = sample_t[idx_holdout]
+    y_trade_hold = y_trade[t_hold].astype(np.int64)
+    y_dir_hold = y_dir[t_hold].astype(np.int64)
+
+    holdout_trade_auc = _safe_auc_binary(y_trade_hold, prob_trade_hold[:, 1])
+    mask_true_trade = (y_trade_hold == 1)
+    holdout_dir_auc = _safe_auc_binary(y_dir_hold[mask_true_trade], prob_dir_hold[mask_true_trade, 1])
+
+    hold_metrics = two_stage_pnl_by_threshold(prob_trade_hold, prob_dir_hold, er_hold, thr_trade_star, thr_dir_star, CFG["cost_bps"])
+
+    print("\nFINAL HOLDOUT RESULT (production-fit, fixed thresholds from val_final):")
+    print(f"  AUC trade={holdout_trade_auc:.3f} | AUC dir(trade-only)={holdout_dir_auc:.3f}")
+    print(f"  trade_rate(pred)={hold_metrics['trade_rate']:.3f}")
+    print(f"  pnl_sum={hold_metrics['pnl_sum']:.4f} | pnl_mean={hold_metrics['pnl_mean']:.6f} | trades={hold_metrics['n_trades']}")
+    print(f"  sharpe(per-bar proxy)={hold_metrics['pnl_sharpe']:.3f}")
+
+    print("\nAUC summary (val_final vs holdout):")
+    print(f"  TRADE: val_auc={r_trade['val']['auc']:.3f} | holdout_auc={holdout_trade_auc:.3f}")
+    print(f"  DIR  : val_auc={r_dir['val']['auc']:.3f} | holdout_auc={holdout_dir_auc:.3f}")
+
+    print("\nTop-5 val_final threshold candidates:")
+    print(sweep_val.head(5)[["thr_trade", "thr_dir", "score", "trade_rate", "pnl_sum", "pnl_sharpe", "n_trades"]])
+
+    # NEW: save production bundles
+    run_root = Path(CFG["bundle_dir"]) / str(CFG.get("run_name", "run"))
+    prod_dir = run_root / "production"
+    extra_common = {
+        "seed": int(SEED),
+        "stage": "production",
+        "assets": list(ASSETS),
+        "target_asset": str(TARGET_ASSET),
+        "target_node": int(TARGET_NODE),
+        "thr_trade": float(thr_trade_star),
+        "thr_dir": float(thr_dir_star),
+        "val_true_trade_rate": float(true_val_trade),
+        "hold_true_trade_rate": float(true_hold_trade),
+        "holdout_trade_auc": float(holdout_trade_auc) if np.isfinite(holdout_trade_auc) else None,
+        "holdout_dir_auc": float(holdout_dir_auc) if np.isfinite(holdout_dir_auc) else None,
     }
     save_bundle(
-        bundle_dir=ART_DIR,
-        name=prod_name,
-        model_state=artifact["model_state"],
+        bundle_dir=prod_dir,
+        name="trade",
+        model_state=_state_dict_to_cpu(m_trade_f.state_dict()),
         cfg=CFG,
-        node_scaler_params=artifact["node_scaler_params"],
-        edge_scaler_params=artifact["edge_scaler_params"],
-        extra_meta=extra_meta,
+        node_scaler_params=node_scaler_params,
+        edge_scaler_params=edge_scaler_params,
+        extra_meta={**extra_common, "model": "trade"},
     )
-    print("\nSaved production bundle as:", prod_name)
-    return prod_name
+    save_bundle(
+        bundle_dir=prod_dir,
+        name="dir",
+        model_state=_state_dict_to_cpu(m_dir_f.state_dict()),
+        cfg=CFG,
+        node_scaler_params=node_scaler_params,
+        edge_scaler_params=edge_scaler_params,
+        extra_meta={**extra_common, "model": "dir"},
+    )
+
+    summary = {
+        "thr_trade": thr_trade_star,
+        "thr_dir": thr_dir_star,
+        "val_true_trade_rate": float(true_val_trade),
+        "hold_true_trade_rate": float(true_hold_trade),
+        "holdout_trade_auc": float(holdout_trade_auc) if np.isfinite(holdout_trade_auc) else np.nan,
+        "holdout_dir_auc": float(holdout_dir_auc) if np.isfinite(holdout_dir_auc) else np.nan,
+        **hold_metrics,
+    }
+
+    print("\n" + "=" * 80)
+    print("\nProduction-fit summary dict:")
+    print(summary)
+    return summary
 
 
-production_name = production_fit_and_save()
-prod_bundle = load_bundle(ART_DIR, production_name)
-idx_eval = np.asarray(prod_bundle["meta"]["idx_test"], dtype=np.int64)
-_ = evaluate_bundle_on_indices(ART_DIR, production_name, idx_eval, label="TEST-ONLY FROM PRODUCTION BUNDLE (holdout)")
+prod_summary = run_production_fit()
+
+
+# %% [markdown]
+# ## Step 13 — Quick example: load a saved bundle (NEW)
+
+# %%
+# Example (does not run training; just shows how to load files saved above)
+# You can change fold_01 -> fold_XX as needed.
+
+example_run_root = Path(CFG["bundle_dir"]) / str(CFG.get("run_name", "run"))
+example_fold_dir = example_run_root / "fold_01"
+
+if example_fold_dir.exists():
+    b_trade = load_bundle(example_fold_dir, "trade")
+    print("Loaded bundle:", example_fold_dir)
+    print("Trade meta keys:", list(b_trade["meta"].keys())[:12], "...")
+    print("Weights tensors:", len(b_trade["state"]), "| first key:", next(iter(b_trade["state"].keys())))
+
+    # Example: rebuild scaler objects if you want transform() API
+    node_scaler_loaded = robust_scaler_from_params(b_trade["node_scaler_params"])
+    _ = node_scaler_loaded  # available for use
+else:
+    print("No saved fold directory found yet at:", example_fold_dir)
