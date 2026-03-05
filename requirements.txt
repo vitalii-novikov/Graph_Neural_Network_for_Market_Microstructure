@@ -1,0 +1,8 @@
+numpy==2.3.4
+pandas==2.2.3
+scikit-learn==1.7.2
+
+# PyTorch core (CPU on macOS uses MPS if available; on Windows this will be CPU unless you install CUDA build)
+torch==2.7.0
+torchvision==0.22.0
+torchaudio==2.7.0
