@@ -1,0 +1,35 @@
+date,Model type,freshness,freq,type,pnl_sum,learning_time,val_auc_trade,val_auc_dir,test_auc_trade,test_auc_dir,n_trades
+7.01.2026,MTGNN1m_2tests,old,1min,Post-CV check,0.21794,,0.700,0.541,0.366,0.363,
+4.01.2026,GAS1m_2tests,old,1min,Post-CV check,0.705414,,0.699,0.61,0.478012,0.510843,
+16.12.2025,GNN_15f2cl2stages,old,1min,Post-CV check,-0.05641657728,,-,-,0.393,0.386,
+7.01.2026,MTGNN1m_2tests,old,1min,Full Refit check,-0.001509,,0.684,0.709,0.448,0.265,
+4.01.2026,GAS1m_2tests,old,1min,Full Refit check,-0.6364,,0.678,0.594,0.481,0.512,
+29.12.2025,GAS1m_1head,old,1min,Full Refit check,-0.2949,,0.575,0.634,0.525,0.472,
+28.12.2025,GAS1m_pnl_15f2cl2s,old,1min,Full Refit check,-1.11,,-,-,0.674,0.663,
+27.12.2025,GAS1m,old,1min,Full Refit check,-0.356,,0.672,0.599,0.524,0.508,
+01.03.2026,MTGNN1m_heads&util_large7,new,1min,Post-CV check,0.3607,227,0.568,0.564,0.499,0.616,556
+24.02.2026,MTGNN1m_heads&util_large6,new,1min,Post-CV check,0.0281,250,0.490,0.568,0.489,0.502,458
+13.02.2026,MTGNN1m_heads&util_large5,new,1min,Post-CV check,0.0128,196,0.484,0.592,0.531,0.533,140
+29.01.2026,MTGNN1m_heads&util_large4,new,1min,Post-CV check,-0.0019,239,0.530,0.63,0.509,0.569,186
+01.02.2026,MTGNN1m_old_good,new,1min,Post-CV check,0.21794,148,0.700,0.541,0.366,0.363,773
+29.01.2026,MTGNN1m_heads&util_large3,new,1min,Post-CV check,0.1028,191,0.567,0.518,0.491,0.485,147
+28.01.2026,MTGNN1m_heads&util2,new,1min,Post-CV check,0.1028,190,0.536,0.522,0.491,0.485,147
+26.01.2026,MTGNN1m_heads&util_large,new,1min,Post-CV check,-0.2899,392,0.526,0.552,0.524,0.556,455
+22.01.2026,MTGNN1m_heads&util_small,new,1min,Post-CV check,-0.5369,100,0.689,0.477,0.539,0.512,482
+20.01.2026,MTGNN1m_heads&util,new,1min,Post-CV check,-0.4391,201,0.620,0.541,0.503,0.498,790
+18.01.2026,MTGNN1m_2SoftUtility,new,1min,Post-CV check,-0.5314,136,0.644,0.494,0.513,0.513,696
+17.01.2026,MTGNN1m_SoftUtility,new,1min,Post-CV check,-0.6337,172,0.667,0.467,0.536,0.5,621
+17.01.2026,MTGNN1m_auc_3class,new,1min,Post-CV check,-0.1026,180,0.668,0.489,0.61,0.493,770
+01.03.2026,MTGNN1m_heads&util_large7,new,1min,Full Refit check,-0.1164,97,0.412,0.495,0.535,0.586,135
+24.02.2026,MTGNN1m_heads&util_large6,new,1min,Full Refit check,0.0514,119,0.439,0.611,0.533,0.578,125
+13.02.2026,MTGNN1m_heads&util_large5,new,1min,Full Refit check,-0.3305,211,0.508,0.849,0.452,0.538,271
+29.01.2026,MTGNN1m_heads&util_large4,new,1min,Full Refit check,-0.1339,121,0.521,0.685,0.523,0.59,280
+01.02.2026,MTGNN1m_old_good,new,1min,Full Refit check,-1.8953,47,0.684,0.709,0.448,0.265,958
+29.01.2026,MTGNN1m_heads&util_large3,new,1min,Full Refit check,-0.2731,125,0.538,0.641,0.54,0.594,245
+28.01.2026,MTGNN1m_heads&util2,new,1min,Full Refit check,-0.2731,125,0.538,0.641,0.54,0.594,245
+26.01.2026,MTGNN1m_heads&util_large,new,1min,Full Refit check,-0.4903,126,0.57,0.62,0.535,0.505,343
+22.01.2026,MTGNN1m_heads&util_small,new,1min,Full Refit check,-0.385,22,0.619,0.565,0.494,0.544,707
+20.01.2026,MTGNN1m_heads&util,new,1min,Full Refit check,-0.6988,42,0.552,0.58,0.471,0.492,669
+18.01.2026,MTGNN1m_2SoftUtility,new,1min,Full Refit check,-0.3165,43,0.609,0.539,0.524,0.537,577
+17.01.2026,MTGNN1m_SoftUtility,new,1min,Full Refit check,-0.0174,60,0.622,0.54,0.505,0.517,732
+17.01.2026,MTGNN1m_auc_3class,new,1min,Full Refit check,0.0915,52,0.626,0.565,0.503,0.57,258
