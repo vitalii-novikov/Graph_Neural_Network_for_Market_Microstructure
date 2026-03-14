@@ -1,0 +1,73 @@
+{
+  "device": "cpu",
+  "assets": [
+    "ADA",
+    "BTC",
+    "ETH"
+  ],
+  "target_asset": "ETH",
+  "panel_rows": 12882,
+  "usable_samples": 12817,
+  "bar_timedelta": "0 days 00:01:00",
+  "forecast_horizon_bars": 5,
+  "lookback_bars": 60,
+  "purge_gap_bars": 5,
+  "receptive_field_bars": 60,
+  "temporal_dilations": [
+    1,
+    2,
+    4,
+    8,
+    16,
+    28
+  ],
+  "effective_temporal_layers": 6,
+  "beta_definition": "beta_src_to_dst = Cov(r_src, r_dst) / Var(r_src)",
+  "window_drop_notes": {
+    "dropped_corr_window_bars": [],
+    "dropped_feature_vol_window_bars": [],
+    "dropped_lead_lag_seconds": []
+  },
+  "execution_assumption": {
+    "long_entry": "mid + spread/2",
+    "long_exit": "mid - spread/2",
+    "short_entry": "mid - spread/2",
+    "short_exit": "mid + spread/2",
+    "fee_bps_one_way": 1.0
+  },
+  "class_balance": {
+    "all_trade_ratio": 0.19567761566669267,
+    "holdout_trade_ratio": 0.22230889235569423
+  },
+  "production_thresholds": {
+    "thr_trade": 0.6,
+    "thr_dir": 0.55
+  },
+  "production_holdout_metrics": {
+    "trade_auc": 0.5640746801808936,
+    "trade_pr_auc": 0.2573202613692492,
+    "trade_brier": 0.24399508513023896,
+    "dir_auc": 0.5628385698808234,
+    "ret_rmse": 0.21963376946872273,
+    "ret_mae": 0.17574366927146912,
+    "price_rmse": 609.8405785531166,
+    "trade_f1": 0.1468354430379747,
+    "trade_balanced_accuracy": 0.5102553273856658,
+    "n_opportunities": 1282,
+    "n_signals": 56,
+    "n_trades": 48,
+    "trade_rate": 0.0374414976599064,
+    "signal_rate": 0.0436817472698908,
+    "fill_rate_given_signal": 0.8571428571428571,
+    "hit_rate": 0.4791666666666667,
+    "cum_net_log_pnl": 0.004727303314033267,
+    "mean_net_log_ret": 9.848548570902639e-05,
+    "mean_gross_log_ret": 0.00029848548570902636,
+    "max_drawdown": -0.020277386203059265,
+    "sharpe_like": 0.1941266962280714,
+    "avg_holding_bars": 5.0,
+    "position_changes": 96,
+    "thr_trade": 0.6,
+    "thr_dir": 0.55
+  }
+}

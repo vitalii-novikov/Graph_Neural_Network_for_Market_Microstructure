@@ -1,1598 +1,1613 @@
 # %% [markdown]
-# # Step 0: Imports, seeding, and configuration
+# # Temporal Graph Baseline for ETH 5-Minute Forecasting
 #
-# This cell defines the full runtime environment for the experiment.
-# It includes imports, reproducibility utilities, device selection, and
-# a single configuration dictionary. The configuration is aligned with a
-# 1-second data regime and a temporal encoder based on self-attention.
+# This notebook implements a clean baseline for the thesis:
+# **Real-Time Market Microstructure Modeling with Temporal Graph Neural Networks**.
 #
-# Compared with a dilated TCN design, attention has quadratic cost in the
-# sequence length, so the lookback window and batch size are kept more
-# conservative. The configuration also exposes a data slice fraction so the
-# script can be run on only the first 25% of the available dataset.
+# Architecture used here:
+# - **Nodes = assets**: ADA, BTC, ETH
+# - **Target asset = ETH**
+# - **Temporal encoder**: causal Transformer applied independently to each asset history
+# - **Graph propagation**: message passing across assets using
+#   1) identity support,
+#   2) dynamic edge-conditioned adjacency from past-only rolling lead-lag correlations,
+#   3) learned adaptive adjacency
+# - **Prediction head**: ETH-only regression head for the fixed-horizon forward return
 #
-# The model remains a spatio-temporal graph model:
-# - nodes are assets,
-# - edge features encode rolling lead-lag and correlation statistics,
-# - the temporal module is attention-based,
-# - the graph module uses message passing over a mixture of supports,
-# - the readout is multi-task: trade / direction / fixed-horizon return.
+# Methodological principles enforced here:
+# - Main supervised target is always the **fixed 5-minute ETH forward log return**
+# - The forecast horizon is fixed in **real clock time** across all frequencies
+# - Threshold selection is done on **validation only**
+# - Trading evaluation uses a **non-overlapping sequential backtest**
+# - Scaling is fit on **train only** for every fold
+# - Walk-forward CV and final production refit use **purge/embargo gaps**
+# - Triple-barrier labeling is intentionally **not used** in this baseline
 
 # %%
+import copy
 import json
+import math
 import os
 import random
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from sklearn.metrics import roc_auc_score
+from sklearn.preprocessing import RobustScaler
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.metrics import roc_auc_score
-from sklearn.preprocessing import RobustScaler
-from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+from torch.utils.data import DataLoader, Dataset
 
+# %% [markdown]
+# ## Imports, seeds, and reproducibility
 
-def seed_everything(seed: int = 1234) -> None:
+# %%
+def seed_everything(seed: int = 42) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
 
-seed_everything(100)
-
+seed_everything(42)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+torch.set_num_threads(max(1, (os.cpu_count() or 4) // 2))
+
 print("DEVICE:", DEVICE)
 
-torch.set_num_threads(max(1, os.cpu_count() or 4))
+# %% [markdown]
+# ## Config
+#
+# Notes:
+# - `freq` may be `"1sec"`, `"1min"`, or `"5min"`
+# - the **forecast horizon** is always 5 real minutes, converted by helper
+# - lookback length is allowed to vary by frequency for practicality
+# - all splitting logic uses a purge gap at least as large as the forecast horizon
 
+# %%
 CFG: Dict[str, Any] = {
-    # ----------------------
-    # data
-    # ----------------------
-    "freq": "1sec",
+    # Core data settings
+    "freq": "1min",  # "1sec", "1min", or "5min"
     "data_dir": "../dataset",
+    "artifact_dir": "./artifacts_temporal_graph_baseline_1min",
+    "assets": ["ADA", "BTC", "ETH"],
+    "target_asset": "ETH",
     "data_slice_start_frac": 0.00,
-    "data_slice_end_frac": 0.25,
-    "final_test_frac": 0.10,
-    # ----------------------
-    # order book
-    # ----------------------
+    "data_slice_end_frac": 0.75,
+
+    # Final untouched holdout
+    "final_holdout_frac": 0.10,
+
+    # Frequency-specific lookback windows (hyperparameter, not target horizon)
+    "lookback_bars_by_freq": {
+        "1sec": 300,
+        "1min": 240,
+        "5min": 120,
+    },
+
+    # Order book / feature settings
     "book_levels": 15,
     "top_levels": 5,
     "near_levels": 5,
-    # ----------------------
-    # walk-forward windows
-    # ----------------------
-    "train_min_frac": 0.55,
+
+    # Edge-feature windows in bars by frequency
+    # These are strictly past-only rolling windows used to summarize cross-asset dependence.
+    "edge_corr_windows_bars_by_freq": {
+        "1sec": [60, 300, 900],
+        "1min": [10, 30, 60],
+        "5min": [6, 12, 24],
+    },
+    "edge_corr_lags_bars": [0, 1, 2, 5],
+    "edge_use_fisher_z": True,
+
+    # Split settings on the pre-holdout region
+    "train_min_frac": 0.50,
     "val_window_frac": 0.10,
     "test_window_frac": 0.10,
     "step_window_frac": 0.10,
-    # ----------------------
-    # scaling
-    # ----------------------
-    "max_abs_feat": 6.0,
-    "max_abs_edge": 3.5,
-    # ----------------------
-    # graph / edge features
-    # ----------------------
-    # All lags are in seconds because the base frequency is 1 second.
-    # Short lags capture microstructure lead-lag patterns, while the longer
-    # lags let the graph prior encode slower cross-asset effects.
-    "corr_windows": [60, 180],
-    "corr_lags": [0, 1, 2, 5, 10, 30, 60, 120, 300, 600],
-    "edges_mode": "all_pairs",
-    "add_self_loops": True,
-    "edge_transform": "fisher",
-    "edge_scale": True,
-    # ----------------------
-    # labels and horizons
-    # ----------------------
-    # A 2-minute prediction horizon keeps the task compatible with 1-second
-    # data while remaining practical for attention-based training.
-    "tb_horizon": 2 * 60,
-    # The temporal context is 5 minutes. This is shorter than the original
-    # TCN-oriented configuration because attention cost grows with L^2.
-    "lookback": 5 * 60,
-    "tb_pt_mult": 1.70,
-    "tb_sl_mult": 1.70,
-    "tb_min_barrier": 0.0014,
-    "tb_max_barrier": 0.0060,
-    "fixed_horizon": 2 * 60,
-    "fixed_ret_clip": 0.0040,
-    # ----------------------
-    # training
-    # ----------------------
-    "batch_size": 32,
-    "epochs": 15,
-    "lr": 3.0e-4,
-    "weight_decay": 5.0e-3,
+    "purge_gap_extra_bars": 0,
+
+    # Scaling
+    "max_abs_node_feature": 8.0,
+    "max_abs_edge_feature": 5.0,
+    "scaler_quantile_low": 5.0,
+    "scaler_quantile_high": 95.0,
+
+    # Model
+    "hidden_dim": 64,
+    "transformer_layers": 2,
+    "transformer_heads": 4,
+    "transformer_ff_mult": 4,
+    "graph_layers": 2,
+    "edge_hidden_dim": 32,
+    "adaptive_adj_dim": 8,
+    "dropout": 0.15,
+
+    # Training
+    "batch_size": 64,
+    "epochs": 40,
+    "patience": 6,
+    "lr": 3e-4,
+    "weight_decay": 1e-4,
     "grad_clip": 1.0,
-    "dropout": 0.20,
-    "use_weighted_sampler": False,
-    "utility_mask_true_trades": False,
-    "use_onecycle": True,
-    "onecycle_pct_start": 0.20,
-    "onecycle_div_factor": 40.0,
-    "onecycle_final_div": 800.0,
-    # ----------------------
-    # attention temporal encoder
-    # ----------------------
-    # The temporal part is now based on self-attention instead of TCN.
-    # Each node sequence is encoded independently over time, then the final
-    # node embeddings are mixed through graph message passing.
-    "attn_model_dim": 64,
-    "attn_num_heads": 4,
-    "attn_num_layers": 3,
-    "attn_ff_mult": 4,
-    # ----------------------
-    # graph propagation after temporal encoding
-    # ----------------------
-    "graph_hidden_dim": 64,
-    "graph_num_layers": 2,
-    # ----------------------
-    # adaptive adjacency
-    # ----------------------
-    "adj_emb_dim": 16,
-    "adj_temperature": 1.25,
-    "adaptive_topk": 3,
-    "adj_l1_lambda": 3e-3,
-    "adj_prior_lambda": 2e-2,
-    # prior adjacency
-    "prior_use_abs": True,
-    "prior_diag_boost": 1.0,
-    "prior_row_normalize": True,
-    # ----------------------
-    # trading evaluation / thresholds
-    # ----------------------
-    "cost_bps": 1.0,
-    "thr_trade_grid": [0.75, 0.80, 0.85, 0.90, 0.93, 0.95, 0.97, 0.98, 0.99],
-    "thr_dir_grid": [0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90],
-    "eval_min_trades": 150,
-    "max_trade_rate_val": 0.03,
-    "trade_rate_penalty": 8.0,
-    "thr_objective": "pnl_sum",
-    "proxy_target_trades": [100, 200, 400, 800],
-    "thr_pairs_check": [],
-    # ----------------------
-    # selection metric
-    # ----------------------
-    "sel_b_dir_auc": 0.55,
-    # ----------------------
-    # loss weights
-    # ----------------------
-    "loss_w_trade": 0.65,
-    "loss_w_dir": 0.80,
-    "loss_w_ret": 0.25,
-    "loss_w_utility": 0.55,
-    # regression / utility stability
-    "ret_huber_delta": 0.0015,
-    "utility_k": 3.0,
-    "utility_scale": 550.0,
-    "utility_return_source": "fixed_ret",
-    "trade_prob_penalty": 2.0,
-    # artifacts
-    "artifact_dir": "./artifacts_attention_1s",
+    "huber_beta": 1.0e-3,
+
+    # Trading / thresholding
+    "cost_bps_per_side": 1.0,
+    "trade_label_buffer_bps": 0.0,
+    "threshold_grid_abs_return": [0.0, 0.0001, 0.0002, 0.0005, 0.0010, 0.0015, 0.0020, 0.0030],
+    "threshold_grid_quantiles": [0.50, 0.60, 0.70, 0.80, 0.85, 0.90, 0.95],
+    "min_validation_trades": 20,
 }
 
-ASSETS = ["ADA", "BTC", "ETH"]
-ASSET2IDX = {a: i for i, a in enumerate(ASSETS)}
-TARGET_ASSET = "ETH"
-TARGET_NODE = ASSET2IDX[TARGET_ASSET]
+ASSETS: List[str] = list(CFG["assets"])
+TARGET_ASSET: str = str(CFG["target_asset"])
+assert TARGET_ASSET in ASSETS
+ASSET2IDX: Dict[str, int] = {a: i for i, a in enumerate(ASSETS)}
+TARGET_NODE: int = ASSET2IDX[TARGET_ASSET]
+ARTIFACT_DIR = Path(CFG["artifact_dir"])
+ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
 
-ART_DIR = Path(CFG["artifact_dir"])
-ART_DIR.mkdir(parents=True, exist_ok=True)
-
-print("Assets:", ASSETS, "| Target:", TARGET_ASSET)
-print("Artifacts dir:", str(ART_DIR.resolve()))
+print("ASSETS:", ASSETS)
+print("TARGET_ASSET:", TARGET_ASSET)
+print("ARTIFACT_DIR:", ARTIFACT_DIR.resolve())
 
 # %% [markdown]
-# # Step 0.1: Graph edges
+# ## Helper functions for frequency and horizon conversion
 #
-# This cell builds the edge list used by the graph module.
-# The script supports either a manual graph or a dense all-pairs graph.
-# For the current setup, all ordered pairs are included, and self-loops are
-# added explicitly. The edge list is later reused both for edge-feature
-# construction and for converting edge-level signals into adjacency matrices.
+# This is the key consistency rule:
+# the model always predicts a **5-minute clock-time horizon**.
+#
+# Therefore:
+# - `1sec  -> 300 bars`
+# - `1min  -> 5 bars`
+# - `5min  -> 1 bar`
 
 # %%
-def build_edge_list(cfg: Dict[str, Any], assets: List[str]) -> List[Tuple[str, str]]:
-    mode = str(cfg.get("edges_mode", "manual"))
-    if mode == "manual":
-        edges = list(cfg["edges"])
-    elif mode == "all_pairs":
-        edges = [(s, t) for s in assets for t in assets if s != t]
-    else:
-        raise ValueError(f"Unknown edges_mode={mode}")
 
-    if bool(cfg.get("add_self_loops", True)):
-        edges = edges + [(a, a) for a in assets]
+
+FREQ = CFG["freq"]
+HORIZON_MINUTES = 5
+HORIZON_BARS = HORIZON_MINUTES
+LOOKBACK_BARS = CFG["lookback_bars_by_freq"][FREQ]
+EDGE_CORR_WINDOWS = CFG["edge_corr_windows_bars_by_freq"][FREQ]
+EDGE_CORR_LAGS = [int(x) for x in CFG["edge_corr_lags_bars"]]
+PURGE_GAP_BARS = HORIZON_BARS + int(CFG["purge_gap_extra_bars"])
+
+print("FREQ:", FREQ)
+print("HORIZON_MINUTES:", HORIZON_MINUTES)
+print("HORIZON_BARS:", HORIZON_BARS)
+print("LOOKBACK_BARS:", LOOKBACK_BARS)
+print("EDGE_CORR_WINDOWS:", EDGE_CORR_WINDOWS)
+print("EDGE_CORR_LAGS:", EDGE_CORR_LAGS)
+print("PURGE_GAP_BARS:", PURGE_GAP_BARS)
+
+# %% [markdown]
+# ## Graph topology
+#
+# We use directed all-pairs edges with self-loops.
+# This is a small graph with nodes = assets.
+
+# %%
+def build_edge_list(assets: List[str], add_self_loops: bool = True) -> List[Tuple[str, str]]:
+    edges = [(src, dst) for src in assets for dst in assets if src != dst]
+    if add_self_loops:
+        edges += [(a, a) for a in assets]
     return edges
 
 
-EDGE_LIST = build_edge_list(CFG, ASSETS)
-EDGE_NAMES = [f"{s}->{t}" for (s, t) in EDGE_LIST]
-EDGE_INDEX = torch.tensor([[ASSET2IDX[s], ASSET2IDX[t]] for (s, t) in EDGE_LIST], dtype=torch.long)
+EDGE_LIST: List[Tuple[str, str]] = build_edge_list(ASSETS, add_self_loops=True)
+EDGE_NAMES: List[str] = [f"{src}->{dst}" for src, dst in EDGE_LIST]
+EDGE_INDEX = torch.tensor(
+    [[ASSET2IDX[src], ASSET2IDX[dst]] for src, dst in EDGE_LIST],
+    dtype=torch.long,
+)
 
-print("EDGE_LIST:", EDGE_NAMES)
-print("EDGE_INDEX:", EDGE_INDEX.tolist())
+print("EDGE_NAMES:", EDGE_NAMES)
+print("EDGE_INDEX:\n", EDGE_INDEX)
 
 # %% [markdown]
-# # Step 1: Data loading
+# ## Data loading
 #
-# This cell loads one CSV per asset, aligns all assets on the rounded timestamp,
-# renames columns into a shared schema, and joins everything into one table.
+# The loader is designed to support the CSV schema used in the old notebook:
+# - timestamp column such as `system_time`
+# - `midpoint`
+# - `spread`
+# - `buys`, `sells`
+# - `bids_notional_0 ... bids_notional_{L-1}`
+# - `asks_notional_0 ... asks_notional_{L-1}`
 #
-# The logic is intentionally close to the original notebook, but a dedicated
-# configuration slice controls how much of the data is used. This makes it easy
-# to keep training runs lightweight when working with 1-second data.
+# The code also accepts a few safe aliases where possible, but standardized names
+# in the notebook remain honest:
+# `bids_notional`, `asks_notional`.
 
 # %%
-def load_asset(
-    asset: str,
-    freq: str,
-    data_dir: Path,
-    book_levels: int,
-    part: Tuple[float, float],
-) -> pd.DataFrame:
+def choose_existing_column(df: pd.DataFrame, candidates: List[str], what: str) -> str:
+    for col in candidates:
+        if col in df.columns:
+            return col
+    raise KeyError(f"Missing required column for {what}. Tried: {candidates}")
+
+
+def infer_timestamp_column(df: pd.DataFrame) -> str:
+    return choose_existing_column(
+        df,
+        ["system_time", "timestamp", "time", "datetime"],
+        "timestamp",
+    )
+
+
+def infer_book_column(df: pd.DataFrame, side_prefix: str, level: int) -> str:
+    candidates = [
+        f"{side_prefix}_notional_{level}",
+        f"{side_prefix}_vol_{level}",
+        f"{side_prefix}_{level}",
+    ]
+    return choose_existing_column(df, candidates, f"{side_prefix} level {level}")
+
+
+def load_one_asset_raw(asset: str, cfg: Dict[str, Any]) -> pd.DataFrame:
+    freq = FREQ
+    data_dir = Path(cfg["data_dir"])
     path = data_dir / f"{asset}_{freq}.csv"
+    if not path.exists():
+        raise FileNotFoundError(f"CSV not found: {path}")
+
     df = pd.read_csv(path)
+    start = int(len(df) * float(cfg["data_slice_start_frac"]))
+    end = int(len(df) * float(cfg["data_slice_end_frac"]))
+    df = df.iloc[start:end].copy()
 
-    start = int(len(df) * float(part[0]))
-    end = int(len(df) * float(part[1]))
-    df = df.iloc[start:end]
+    ts_col = infer_timestamp_column(df)
+    df["timestamp"] = pd.to_datetime(df[ts_col], utc=True, errors="coerce").dt.round('min')
+    df = df.dropna(subset=["timestamp"]).sort_values("timestamp")
+    df = df[~df["timestamp"].duplicated(keep="last")].set_index("timestamp")
 
-    df["timestamp"] = pd.to_datetime(df["system_time"]).dt.round("s")
-    df = df.sort_values("timestamp").set_index("timestamp")
+    midpoint_col = choose_existing_column(df, ["midpoint", "mid", "price"], "midpoint")
+    spread_col = choose_existing_column(df, ["spread"], "spread")
+    buys_col = choose_existing_column(df, ["buys"], "buys")
+    sells_col = choose_existing_column(df, ["sells"], "sells")
 
-    bid_cols = [f"bids_notional_{i}" for i in range(book_levels)]
-    ask_cols = [f"asks_notional_{i}" for i in range(book_levels)]
+    book_levels = int(cfg["book_levels"])
+    standardized = pd.DataFrame(index=df.index)
+    standardized[f"mid_{asset}"] = pd.to_numeric(df[midpoint_col], errors="coerce")
+    standardized[f"spread_{asset}"] = pd.to_numeric(df[spread_col], errors="coerce")
+    standardized[f"buys_{asset}"] = pd.to_numeric(df[buys_col], errors="coerce")
+    standardized[f"sells_{asset}"] = pd.to_numeric(df[sells_col], errors="coerce")
 
-    needed = ["midpoint", "spread", "buys", "sells"] + bid_cols + ask_cols
-    missing = [c for c in needed if c not in df.columns]
-    if missing:
-        raise ValueError(f"{asset}: missing columns in CSV: {missing[:10]}{'...' if len(missing) > 10 else ''}")
+    for level in range(book_levels):
+        bid_col = infer_book_column(df, "bids", level)
+        ask_col = infer_book_column(df, "asks", level)
+        standardized[f"bids_notional_{asset}_{level}"] = pd.to_numeric(df[bid_col], errors="coerce")
+        standardized[f"asks_notional_{asset}_{level}"] = pd.to_numeric(df[ask_col], errors="coerce")
 
-    return df[needed]
-
-
-def load_all_assets() -> pd.DataFrame:
-    freq = CFG["freq"]
-    data_dir = Path(CFG["data_dir"])
-    book_levels = CFG["book_levels"]
-    part = (float(CFG["data_slice_start_frac"]), float(CFG["data_slice_end_frac"]))
-
-    def rename_cols(df_one: pd.DataFrame, asset: str) -> pd.DataFrame:
-        rename_map = {
-            "midpoint": asset,
-            "buys": f"buys_{asset}",
-            "sells": f"sells_{asset}",
-            "spread": f"spread_{asset}",
-        }
-        for i in range(book_levels):
-            rename_map[f"bids_notional_{i}"] = f"bids_vol_{asset}_{i}"
-            rename_map[f"asks_notional_{i}"] = f"asks_vol_{asset}_{i}"
-        return df_one.rename(columns=rename_map)
-
-    df_ada = rename_cols(load_asset("ADA", freq, data_dir, book_levels, part=part), "ADA")
-    df_btc = rename_cols(load_asset("BTC", freq, data_dir, book_levels, part=part), "BTC")
-    df_eth = rename_cols(load_asset("ETH", freq, data_dir, book_levels, part=part), "ETH")
-
-    df = df_ada.join(df_btc, how="inner").join(df_eth, how="inner").reset_index()
-    return df
+    standardized = standardized.replace([np.inf, -np.inf], np.nan)
+    standardized = standardized.dropna()
+    return standardized
 
 
-df = load_all_assets()
-for a in ASSETS:
-    df[f"lr_{a}"] = np.log(df[a]).diff().fillna(0.0)
+def load_and_align_assets(cfg: Dict[str, Any]) -> pd.DataFrame:
+    aligned: Optional[pd.DataFrame] = None
+    for asset in ASSETS:
+        one = load_one_asset_raw(asset, cfg)
+        aligned = one if aligned is None else aligned.join(one, how="inner")
 
-print("Loaded df:", df.shape)
+    if aligned is None:
+        raise RuntimeError("No asset data loaded")
+
+    aligned = aligned.sort_index()
+    aligned = aligned[~aligned.index.duplicated(keep="last")].copy()
+
+    for asset in ASSETS:
+        mid = aligned[f"mid_{asset}"].astype(float)
+        aligned[f"lr_{asset}"] = np.log(mid).diff().fillna(0.0)
+
+    aligned = aligned.reset_index().rename(columns={"index": "timestamp"})
+    return aligned
+
+
+df = load_and_align_assets(CFG)
+
+print("Loaded aligned dataframe shape:", df.shape)
 print("Time range:", df["timestamp"].min(), "->", df["timestamp"].max())
 print(df.head(2))
 
 # %% [markdown]
-# # Step 2: Edge features
+# ## Feature engineering
 #
-# This cell builds edge-level features for each ordered asset pair.
-# For an edge s -> t, the features are rolling correlations between the lagged
-# source return and the target return over multiple windows. This produces a
-# time-dependent edge tensor that later acts as a graph prior.
+# Per-asset node features:
+# - `lr_1bar`: current 1-bar log return
+# - `rel_spread`: spread / midpoint
+# - `log_buys`, `log_sells`
+# - `flow_imbalance`
+# - `depth_imbalance_total`
+# - top-book level imbalances
+# - near/far depth ratios
+# - near/far depth imbalances
 #
-# The features are still built from the same basic idea as the original code,
-# but the comments are now aligned with the true units used in the script:
-# all lags and windows are expressed in seconds.
+# Importantly, order-book fields are called **notional**, not “volume”, because the old
+# schema used notional columns.
 
 # %%
-def _fisher_z(x: np.ndarray, eps: float = 1e-6) -> np.ndarray:
-    x = np.clip(x, -0.999, 0.999)
-    return 0.5 * np.log((1.0 + x + eps) / (1.0 - x + eps))
+EPS = 1e-12
 
 
-def build_corr_array(
-    df_: pd.DataFrame,
-    corr_windows: List[int],
-    edges: List[Tuple[str, str]],
-    lags: List[int],
-    transform: str = "fisher",
-) -> np.ndarray:
-    """
-    Edge features per time:
-      for edge s->t:
-        for lag in lags:
-          corr(lr_s.shift(lag), lr_t) over rolling window
-    Self-loop edges are set to 1.0 for all edge features.
-    """
-    t_len = len(df_)
-    e_len = len(edges)
-    w_len = len(corr_windows)
-    l_len = len(lags)
-    out = np.zeros((t_len, e_len, w_len * l_len), dtype=np.float32)
-
-    lr_map = {a: df_[f"lr_{a}"].astype(float) for a in ASSETS}
-
-    for ei, (s, t) in enumerate(edges):
-        if s == t:
-            out[:, ei, :] = 1.0
-            continue
-
-        src0 = lr_map[s]
-        dst0 = lr_map[t]
-
-        feat_idx = 0
-        for lag in lags:
-            src = src0.shift(int(lag)) if int(lag) > 0 else src0
-            for w in corr_windows:
-                r = src.rolling(int(w), min_periods=1).corr(dst0)
-                r = np.nan_to_num(r.to_numpy(dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
-                if transform == "fisher":
-                    r = _fisher_z(r).astype(np.float32)
-                out[:, ei, feat_idx] = r
-                feat_idx += 1
-
-    return out.astype(np.float32)
-
-
-edge_feat = build_corr_array(
-    df,
-    CFG["corr_windows"],
-    EDGE_LIST,
-    CFG["corr_lags"],
-    transform=str(CFG.get("edge_transform", "fisher")),
-)
-
-print("edge_feat shape:", edge_feat.shape, "(T,E,edge_dim)")
-print("edge_dim =", edge_feat.shape[-1])
-
-# %% [markdown]
-# # Step 3: Labels
-#
-# This cell creates the supervision targets.
-# Triple-barrier labels remain the source of the trade/no-trade and direction
-# targets, while a fixed-horizon return target is added for regression and
-# soft-utility optimization.
-#
-# The setup stays close to the original notebook, but the comments now match the
-# actual horizon used in the configuration.
-
-# %%
-EPS = 1e-6
-
-
-def triple_barrier_labels_from_lr(
-    lr: pd.Series,
-    horizon: int,
-    vol_window: int,
-    pt_mult: float,
-    sl_mult: float,
-    min_barrier: float,
-    max_barrier: float,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Returns:
-      y_tb: {0=down, 1=flat/no-trade, 2=up}
-      exit_ret: realized log-return to exit (tp/sl/timeout)
-      exit_t: exit index
-      thr: barrier per t
-    """
-    lr = lr.astype(float).copy()
-    t_len = len(lr)
-
-    vol = lr.rolling(vol_window, min_periods=max(10, vol_window // 10)).std().shift(1)
-    thr = (vol * np.sqrt(horizon)).clip(lower=min_barrier, upper=max_barrier)
-
-    y = np.ones(t_len, dtype=np.int64)
-    exit_ret = np.zeros(t_len, dtype=np.float32)
-    exit_t = np.arange(t_len, dtype=np.int64)
-
-    lr_np = lr.fillna(0.0).to_numpy(dtype=np.float64)
-    thr_np = thr.fillna(min_barrier).to_numpy(dtype=np.float64)
-
-    for t in range(t_len - horizon - 1):
-        up = pt_mult * thr_np[t]
-        dn = -sl_mult * thr_np[t]
-
-        cum = 0.0
-        hit = 1
-        et = t + horizon
-        er = 0.0
-
-        for dt in range(1, horizon + 1):
-            cum += lr_np[t + dt]
-            if cum >= up:
-                hit, et, er = 2, t + dt, cum
-                break
-            if cum <= dn:
-                hit, et, er = 0, t + dt, cum
-                break
-
-        if hit == 1:
-            er = float(np.sum(lr_np[t + 1: t + horizon + 1]))
-            et = t + horizon
-
-        y[t] = hit
-        exit_ret[t] = er
-        exit_t[t] = et
-
-    return y, exit_ret, exit_t, thr_np
-
-
-def fixed_horizon_future_return(lr: np.ndarray, horizon: int) -> np.ndarray:
-    """
-    r_H(t) = sum_{i=1..H} lr[t+i]
-    For the last H timesteps, return 0.0 because they are not sampled later.
-    """
-    lr = np.asarray(lr, dtype=np.float64)
-    t_len = lr.shape[0]
-    out = np.zeros(t_len, dtype=np.float32)
-    if horizon <= 0:
-        return out
-    for t in range(0, t_len - horizon - 1):
-        out[t] = float(lr[t + 1: t + horizon + 1].sum())
-    return out
-
-
-y_tb, exit_ret, exit_t, tb_thr = triple_barrier_labels_from_lr(
-    df["lr_ETH"],
-    horizon=int(CFG["tb_horizon"]),
-    vol_window=int(CFG["lookback"]),
-    pt_mult=float(CFG["tb_pt_mult"]),
-    sl_mult=float(CFG["tb_sl_mult"]),
-    min_barrier=float(CFG["tb_min_barrier"]),
-    max_barrier=float(CFG["tb_max_barrier"]),
-)
-
-y_trade = (y_tb != 1).astype(np.int64)
-y_dir = (y_tb == 2).astype(np.int64)
-
-fixed_ret = fixed_horizon_future_return(df["lr_ETH"].to_numpy(dtype=np.float64), int(CFG["fixed_horizon"]))
-
-dist = np.bincount(y_tb, minlength=3)
-print("TB dist [down, flat, up]:", dist)
-print("True trade ratio:", float(y_trade.mean()))
-print("fixed_ret stats: mean=", float(np.mean(fixed_ret)), "std=", float(np.std(fixed_ret)))
-
-# %% [markdown]
-# # Step 4: Node features
-#
-# This cell constructs node-level features for each asset.
-# The feature tensor keeps the same general logic as before: microstructure
-# features, order-flow features, and book-depth imbalance features are stacked
-# per asset and then combined into a tensor of shape (T, N, F).
-#
-# The sampled indices are also prepared here so later datasets can work with a
-# fixed lookback and future horizon without leakage.
-
-# %%
 def safe_log1p(x: np.ndarray) -> np.ndarray:
     return np.log1p(np.maximum(x, 0.0))
 
 
-def build_node_tensor(df_: pd.DataFrame) -> Tuple[np.ndarray, List[str]]:
-    book_levels = int(CFG["book_levels"])
-    top_k = int(CFG["top_levels"])
-    near_k = int(CFG["near_levels"])
+def build_node_feature_tensor(df_: pd.DataFrame, cfg: Dict[str, Any]) -> Tuple[np.ndarray, List[str]]:
+    book_levels = int(cfg["book_levels"])
+    top_levels = int(cfg["top_levels"])
+    near_levels = int(cfg["near_levels"])
 
-    if near_k >= book_levels:
-        raise ValueError("CFG['near_levels'] must be < CFG['book_levels']")
+    if top_levels > book_levels:
+        raise ValueError("top_levels must be <= book_levels")
+    if near_levels >= book_levels:
+        raise ValueError("near_levels must be < book_levels")
 
-    feat_names = [
-        "lr",
-        "spread",
+    feature_names = [
+        "lr_1bar",
+        "rel_spread",
         "log_buys",
         "log_sells",
-        "ofi",
-        "DI_15",
-        "DI_L0",
-        "DI_L1",
-        "DI_L2",
-        "DI_L3",
-        "DI_L4",
-        "near_ratio_bid",
-        "near_ratio_ask",
-        "di_near",
-        "di_far",
+        "flow_imbalance",
+        "depth_imbalance_total",
+        "top_imbalance_0",
+        "top_imbalance_1",
+        "top_imbalance_2",
+        "top_imbalance_3",
+        "top_imbalance_4",
+        "bid_near_far_ratio",
+        "ask_near_far_ratio",
+        "depth_imbalance_near",
+        "depth_imbalance_far",
     ]
 
-    feats_all = []
-    for a in ASSETS:
-        lr = df_[f"lr_{a}"].values.astype(np.float32)
-        spread = df_[f"spread_{a}"].values.astype(np.float32)
+    all_assets = []
+    for asset in ASSETS:
+        lr = df_[f"lr_{asset}"].to_numpy(dtype=np.float32)
+        mid = df_[f"mid_{asset}"].to_numpy(dtype=np.float32)
+        spread = df_[f"spread_{asset}"].to_numpy(dtype=np.float32)
+        buys = df_[f"buys_{asset}"].to_numpy(dtype=np.float32)
+        sells = df_[f"sells_{asset}"].to_numpy(dtype=np.float32)
 
-        buys = df_[f"buys_{a}"].values.astype(np.float32)
-        sells = df_[f"sells_{a}"].values.astype(np.float32)
-
+        rel_spread = spread / (mid + EPS)
         log_buys = safe_log1p(buys).astype(np.float32)
         log_sells = safe_log1p(sells).astype(np.float32)
-        ofi = ((buys - sells) / (buys + sells + EPS)).astype(np.float32)
+        flow_imb = ((buys - sells) / (buys + sells + EPS)).astype(np.float32)
 
-        bids_lvls = np.stack([df_[f"bids_vol_{a}_{i}"].values.astype(np.float32) for i in range(book_levels)], axis=1)
-        asks_lvls = np.stack([df_[f"asks_vol_{a}_{i}"].values.astype(np.float32) for i in range(book_levels)], axis=1)
+        bids = np.stack(
+            [df_[f"bids_notional_{asset}_{i}"].to_numpy(dtype=np.float32) for i in range(book_levels)],
+            axis=1,
+        )
+        asks = np.stack(
+            [df_[f"asks_notional_{asset}_{i}"].to_numpy(dtype=np.float32) for i in range(book_levels)],
+            axis=1,
+        )
 
-        bid_sum = bids_lvls.sum(axis=1)
-        ask_sum = asks_lvls.sum(axis=1)
-        di_15 = ((bid_sum - ask_sum) / (bid_sum + ask_sum + EPS)).astype(np.float32)
+        bid_total = bids.sum(axis=1)
+        ask_total = asks.sum(axis=1)
+        depth_imb_total = ((bid_total - ask_total) / (bid_total + ask_total + EPS)).astype(np.float32)
 
-        di_levels = []
-        for i in range(top_k):
-            b = bids_lvls[:, i]
-            s = asks_lvls[:, i]
-            di_levels.append(((b - s) / (b + s + EPS)).astype(np.float32))
-        di_l0_4 = np.stack(di_levels, axis=1)
+        top_imbals = []
+        for i in range(top_levels):
+            bi = bids[:, i]
+            ai = asks[:, i]
+            top_imbals.append(((bi - ai) / (bi + ai + EPS)).astype(np.float32))
+        top_imbals = np.stack(top_imbals, axis=1)
 
-        bid_near = bids_lvls[:, :near_k].sum(axis=1)
-        ask_near = asks_lvls[:, :near_k].sum(axis=1)
-        bid_far = bids_lvls[:, near_k:].sum(axis=1)
-        ask_far = asks_lvls[:, near_k:].sum(axis=1)
+        bid_near = bids[:, :near_levels].sum(axis=1)
+        ask_near = asks[:, :near_levels].sum(axis=1)
+        bid_far = bids[:, near_levels:].sum(axis=1)
+        ask_far = asks[:, near_levels:].sum(axis=1)
 
-        near_ratio_bid = (bid_near / (bid_far + EPS)).astype(np.float32)
-        near_ratio_ask = (ask_near / (ask_far + EPS)).astype(np.float32)
-        di_near = ((bid_near - ask_near) / (bid_near + ask_near + EPS)).astype(np.float32)
-        di_far = ((bid_far - ask_far) / (bid_far + ask_far + EPS)).astype(np.float32)
+        bid_near_far_ratio = (bid_near / (bid_far + EPS)).astype(np.float32)
+        ask_near_far_ratio = (ask_near / (ask_far + EPS)).astype(np.float32)
+        depth_imb_near = ((bid_near - ask_near) / (bid_near + ask_near + EPS)).astype(np.float32)
+        depth_imb_far = ((bid_far - ask_far) / (bid_far + ask_far + EPS)).astype(np.float32)
 
-        xa = np.column_stack([
-            lr,
-            spread,
-            log_buys,
-            log_sells,
-            ofi,
-            di_15,
-            di_l0_4[:, 0],
-            di_l0_4[:, 1],
-            di_l0_4[:, 2],
-            di_l0_4[:, 3],
-            di_l0_4[:, 4],
-            near_ratio_bid,
-            near_ratio_ask,
-            di_near,
-            di_far,
-        ]).astype(np.float32)
+        asset_features = np.column_stack(
+            [
+                lr,
+                rel_spread,
+                log_buys,
+                log_sells,
+                flow_imb,
+                depth_imb_total,
+                top_imbals[:, 0],
+                top_imbals[:, 1],
+                top_imbals[:, 2],
+                top_imbals[:, 3],
+                top_imbals[:, 4],
+                bid_near_far_ratio,
+                ask_near_far_ratio,
+                depth_imb_near,
+                depth_imb_far,
+            ]
+        ).astype(np.float32)
 
-        feats_all.append(xa)
+        all_assets.append(asset_features)
 
-    x = np.stack(feats_all, axis=1).astype(np.float32)
-    return x, feat_names
+    x_node = np.stack(all_assets, axis=1).astype(np.float32)  # [T, N, F]
+    x_node = np.nan_to_num(x_node, nan=0.0, posinf=0.0, neginf=0.0)
+    return x_node, feature_names
 
 
-X_node_raw, node_feat_names = build_node_tensor(df)
-
-T = len(df)
-L = int(CFG["lookback"])
-H_TB = int(CFG["tb_horizon"])
-H_FIXED = int(CFG["fixed_horizon"])
-
-t_min = L - 1
-t_max = T - max(H_TB, H_FIXED) - 2
-sample_t = np.arange(t_min, t_max + 1)
-n_samples = len(sample_t)
-
-print("X_node_raw:", X_node_raw.shape, "edge_feat:", edge_feat.shape)
-print("n_samples:", n_samples, "| t range:", int(sample_t[0]), "->", int(sample_t[-1]))
+X_NODE_RAW, NODE_FEATURE_NAMES = build_node_feature_tensor(df, CFG)
+print("X_NODE_RAW shape:", X_NODE_RAW.shape)
+print("NODE_FEATURE_NAMES:", NODE_FEATURE_NAMES)
 
 # %% [markdown]
-# # Step 5: Splits
+# ## Edge features
 #
-# This cell keeps the original split logic: first reserve a final holdout,
-# then build rolling walk-forward train / validation / test windows inside the
-# remaining sample range. The resulting indices are later reused exactly as in
-# the notebook workflow.
+# For each directed edge, we compute a vector of past-only rolling lead-lag correlations
+# between source and destination returns.
+#
+# Important note:
+# - these edge features are **not** a full temporal edge sequence inside the model
+# - the model uses **only the last edge snapshot at prediction time**
+# - this is a deliberate simplification for a clean baseline
 
 # %%
-def make_final_holdout_split(n_samples_: int, final_test_frac: float) -> Tuple[np.ndarray, np.ndarray]:
-    if not (0.0 < final_test_frac < 0.5):
-        raise ValueError("final_test_frac should be in (0, 0.5)")
-    n_final = max(1, int(round(final_test_frac * n_samples_)))
-    n_cv = n_samples_ - n_final
-    if n_cv <= 50:
-        raise ValueError("Too few samples left for CV after holdout split.")
-    idx_cv = np.arange(0, n_cv, dtype=np.int64)
-    idx_final = np.arange(n_cv, n_samples_, dtype=np.int64)
-    return idx_cv, idx_final
+def fisher_z_transform(x: np.ndarray) -> np.ndarray:
+    x = np.clip(x, -0.999999, 0.999999)
+    return 0.5 * np.log((1.0 + x) / (1.0 - x))
 
 
-def make_walk_forward_splits(
-    n_samples_: int,
+def build_edge_feature_tensor(
+    df_: pd.DataFrame,
+    assets: List[str],
+    edge_list: List[Tuple[str, str]],
+    windows: List[int],
+    lags: List[int],
+    use_fisher_z: bool = True,
+) -> np.ndarray:
+    t_len = len(df_)
+    n_edges = len(edge_list)
+    n_feat = len(windows) * len(lags)
+
+    out = np.zeros((t_len, n_edges, n_feat), dtype=np.float32)
+    lr_map = {asset: df_[f"lr_{asset}"].astype(float) for asset in assets}
+
+    for e_idx, (src, dst) in enumerate(edge_list):
+        if src == dst:
+            out[:, e_idx, :] = 1.0
+            continue
+
+        src_series = lr_map[src]
+        dst_series = lr_map[dst]
+
+        feat_pos = 0
+        for lag in lags:
+            shifted_src = src_series.shift(int(lag)) if int(lag) > 0 else src_series
+            for window in windows:
+                min_periods = max(3, int(window) // 2)
+                corr = shifted_src.rolling(window=int(window), min_periods=min_periods).corr(dst_series)
+                arr = corr.to_numpy(dtype=np.float64)
+                arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+                if use_fisher_z:
+                    arr = fisher_z_transform(arr)
+                out[:, e_idx, feat_pos] = arr.astype(np.float32)
+                feat_pos += 1
+
+    return np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+
+EDGE_FEATURE_RAW = build_edge_feature_tensor(
+    df_=df,
+    assets=ASSETS,
+    edge_list=EDGE_LIST,
+    windows=EDGE_CORR_WINDOWS,
+    lags=EDGE_CORR_LAGS,
+    use_fisher_z=bool(CFG["edge_use_fisher_z"]),
+)
+
+print("EDGE_FEATURE_RAW shape:", EDGE_FEATURE_RAW.shape)
+
+# %% [markdown]
+# ## Target construction
+#
+# Primary target:
+# - **ETH forward log return over exactly 5 minutes of clock time**
+#
+# Auxiliary evaluation labels derived from the same target:
+# - `direction_label`: whether the future ETH return is positive
+# - `trade_label`: whether the future absolute ETH return exceeds a transaction-cost-aware threshold
+#
+# Definitions:
+# - `dir_auc` uses the raw regression score `pred_return`
+# - `trade_auc` uses the magnitude score `abs(pred_return)`
+# - these labels are **evaluation-only**, not training targets
+
+# %%
+def fixed_horizon_forward_log_return(lr: np.ndarray, horizon_bars: int) -> np.ndarray:
+    lr = np.asarray(lr, dtype=np.float64)
+    out = np.full(len(lr), np.nan, dtype=np.float32)
+
+    if horizon_bars <= 0:
+        raise ValueError("horizon_bars must be positive")
+
+    csum = np.cumsum(np.insert(lr, 0, 0.0))
+    last_valid_t = len(lr) - horizon_bars - 1
+    if last_valid_t < 0:
+        return out
+
+    idx = np.arange(0, last_valid_t + 1)
+    future_sum = csum[idx + horizon_bars + 1] - csum[idx + 1]
+    out[idx] = future_sum.astype(np.float32)
+    return out
+
+
+def round_trip_cost_as_log_return(cost_bps_per_side: float) -> float:
+    return 2.0 * float(cost_bps_per_side) * 1e-4
+
+
+ETH_LR = df[f"lr_{TARGET_ASSET}"].to_numpy(dtype=np.float64)
+Y_RET = fixed_horizon_forward_log_return(ETH_LR, horizon_bars=HORIZON_BARS)
+
+TRADE_LABEL_ABS_RETURN_THRESHOLD = (
+    round_trip_cost_as_log_return(CFG["cost_bps_per_side"])
+    + float(CFG["trade_label_buffer_bps"]) * 1e-4
+)
+
+# Direction label: 1 if future return > 0, 0 if future return < 0, NaN if exactly 0 or invalid.
+Y_DIR = np.full(len(Y_RET), np.nan, dtype=np.float32)
+valid_dir_pos = np.isfinite(Y_RET) & (Y_RET > 0.0)
+valid_dir_neg = np.isfinite(Y_RET) & (Y_RET < 0.0)
+Y_DIR[valid_dir_pos] = 1.0
+Y_DIR[valid_dir_neg] = 0.0
+
+# Trade label: 1 if |future return| exceeds round-trip cost-aware threshold, else 0.
+Y_TRADE = np.full(len(Y_RET), np.nan, dtype=np.float32)
+valid_trade = np.isfinite(Y_RET)
+Y_TRADE[valid_trade] = (np.abs(Y_RET[valid_trade]) > TRADE_LABEL_ABS_RETURN_THRESHOLD).astype(np.float32)
+
+print("Y_RET finite count:", int(np.isfinite(Y_RET).sum()))
+print("TRADE_LABEL_ABS_RETURN_THRESHOLD:", TRADE_LABEL_ABS_RETURN_THRESHOLD)
+
+# %% [markdown]
+# ## Valid sample range
+#
+# A sample at time `t` is valid only if:
+# - its full lookback window exists
+# - its full fixed-horizon target exists
+#
+# `sample_t[i]` maps sample index `i` to raw time index `t`.
+
+# %%
+T = len(df)
+first_valid_t = LOOKBACK_BARS - 1
+last_valid_t = T - HORIZON_BARS - 1
+
+if last_valid_t < first_valid_t:
+    raise RuntimeError(
+        f"Not enough rows after slicing. Need at least lookback={LOOKBACK_BARS} and horizon={HORIZON_BARS}."
+    )
+
+SAMPLE_T = np.arange(first_valid_t, last_valid_t + 1, dtype=np.int64)
+N_SAMPLES = len(SAMPLE_T)
+
+print("T:", T)
+print("first_valid_t:", first_valid_t)
+print("last_valid_t:", last_valid_t)
+print("N_SAMPLES:", N_SAMPLES)
+
+# %% [markdown]
+# ## Split generation with purge/embargo
+#
+# We first carve out a final untouched holdout.
+#
+# Importantly, we leave a **gap before the holdout** so that the pre-holdout region does not
+# contain labels that overlap into holdout.
+#
+# Then, inside the pre-holdout region, walk-forward CV uses:
+# - train
+# - purge gap
+# - validation
+# - purge gap
+# - test
+
+# %%
+def make_preholdout_and_holdout_split(
+    n_samples: int,
+    holdout_frac: float,
+    gap: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    if not (0.0 < holdout_frac < 0.5):
+        raise ValueError("holdout_frac must be in (0, 0.5)")
+
+    holdout_n = max(1, int(round(n_samples * float(holdout_frac))))
+    preholdout_n = n_samples - gap - holdout_n
+
+    if preholdout_n <= 0:
+        raise RuntimeError("Not enough samples for pre-holdout region after reserving gap and holdout.")
+
+    idx_preholdout = np.arange(0, preholdout_n, dtype=np.int64)
+    idx_holdout = np.arange(preholdout_n + gap, preholdout_n + gap + holdout_n, dtype=np.int64)
+
+    if idx_holdout[-1] >= n_samples:
+        raise RuntimeError("Holdout indices exceed available sample count.")
+
+    return idx_preholdout, idx_holdout
+
+
+def make_walk_forward_splits_with_gap(
+    n_preholdout: int,
     train_min_frac: float,
     val_window_frac: float,
     test_window_frac: float,
     step_window_frac: float,
+    gap: int,
 ) -> List[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
-    train_min = int(train_min_frac * n_samples_)
-    val_w = max(1, int(val_window_frac * n_samples_))
-    test_w = max(1, int(test_window_frac * n_samples_))
-    step_w = max(1, int(step_window_frac * n_samples_))
+    train_min = max(1, int(round(n_preholdout * train_min_frac)))
+    # Validation/test fractions are interpreted as full blocks that already include purge gaps:
+    # block size = gap + effective window size.
+    val_block_n = max(gap + 1, int(round(n_preholdout * val_window_frac)))
+    test_block_n = max(gap + 1, int(round(n_preholdout * test_window_frac)))
+    val_n = max(1, val_block_n - gap)
+    test_n = max(1, test_block_n - gap)
+    step_n = max(1, int(round(n_preholdout * step_window_frac)))
 
-    splits = []
-    start = train_min
+    splits: List[Tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+    train_end = train_min
+
     while True:
-        tr_end = start
-        va_end = tr_end + val_w
-        te_end = va_end + test_w
-        if te_end > n_samples_:
+        val_start = train_end + gap
+        val_end = val_start + val_n
+        test_start = val_end + gap
+        test_end = test_start + test_n
+
+        if test_end > n_preholdout:
             break
 
-        idx_train = np.arange(0, tr_end, dtype=np.int64)
-        idx_val = np.arange(tr_end, va_end, dtype=np.int64)
-        idx_test = np.arange(va_end, te_end, dtype=np.int64)
-        splits.append((idx_train, idx_val, idx_test))
-        start += step_w
+        idx_train = np.arange(0, train_end, dtype=np.int64)
+        idx_val = np.arange(val_start, val_end, dtype=np.int64)
+        idx_test = np.arange(test_start, test_end, dtype=np.int64)
+
+        if len(idx_train) > 0 and len(idx_val) > 0 and len(idx_test) > 0:
+            splits.append((idx_train, idx_val, idx_test))
+
+        train_end += step_n
 
     return splits
 
 
-idx_cv_all, idx_final_test = make_final_holdout_split(n_samples, float(CFG["final_test_frac"]))
-n_samples_cv = len(idx_cv_all)
+IDX_PREHOLDOUT, IDX_HOLDOUT = make_preholdout_and_holdout_split(
+    n_samples=N_SAMPLES,
+    holdout_frac=float(CFG["final_holdout_frac"]),
+    gap=PURGE_GAP_BARS,
+)
 
-walk_splits = make_walk_forward_splits(
-    n_samples_=n_samples_cv,
+WALK_FORWARD_SPLITS = make_walk_forward_splits_with_gap(
+    n_preholdout=len(IDX_PREHOLDOUT),
     train_min_frac=float(CFG["train_min_frac"]),
     val_window_frac=float(CFG["val_window_frac"]),
     test_window_frac=float(CFG["test_window_frac"]),
     step_window_frac=float(CFG["step_window_frac"]),
+    gap=PURGE_GAP_BARS,
 )
 
-print("Holdout split:")
-print(f"  n_samples total: {n_samples}")
-print(f"  n_samples CV   : {len(idx_cv_all)}")
-print(f"  n_samples FINAL: {len(idx_final_test)}")
-print("\nWalk-forward folds:", len(walk_splits))
-for i, (a, b, c) in enumerate(walk_splits, 1):
-    print(f"  fold {i}: train={len(a)} | val={len(b)} | test={len(c)}")
+if len(WALK_FORWARD_SPLITS) == 0:
+    raise RuntimeError("No valid walk-forward splits were created. Adjust split fractions or data size.")
+
+print("Pre-holdout sample count:", len(IDX_PREHOLDOUT))
+print("Holdout sample count:", len(IDX_HOLDOUT))
+print("Number of CV folds:", len(WALK_FORWARD_SPLITS))
+for i, (tr, va, te) in enumerate(WALK_FORWARD_SPLITS, start=1):
+    print(f"Fold {i}: train={len(tr)}, val={len(va)}, test={len(te)}")
 
 # %% [markdown]
-# # Step 6: Dataset, scaling helpers, and sampling
+# ## Dataset and DataLoaders
 #
-# This cell prepares the runtime interfaces used during training and evaluation.
-# The dataset returns a full node sequence and only the last edge snapshot.
-# This keeps the edge pathway lightweight because edge features are used to
-# build the current graph prior, while the temporal dynamics are modeled from
-# node sequences through attention.
-#
-# The scaling helpers fit robust scalers on the training time region only,
-# which preserves the original no-leakage scaling logic.
+# Each sample returns:
+# - node feature sequence: `[lookback, n_nodes, n_features]`
+# - last edge snapshot: `[n_edges, n_edge_features]`
+# - fixed-horizon target return
 
 # %%
-class LobGraphSequenceDatasetTwoHeadFixedH(Dataset):
-    """
-    Returns:
-      x_seq:      (L, N, F)
-      e_last:     (E, D)
-      y_trade:    scalar in {0, 1}
-      y_dir:      scalar in {0, 1} and meaningful only when y_trade = 1
-      exit_ret:   scalar (triple-barrier realized return)
-      fixed_ret:  scalar (fixed-horizon future return)
-      sidx:       scalar sample index
-    """
-
+class TemporalGraphDataset(Dataset):
     def __init__(
         self,
         x_node: np.ndarray,
-        e_feat: np.ndarray,
-        y_trade_arr: np.ndarray,
-        y_dir_arr: np.ndarray,
-        exit_ret_arr: np.ndarray,
-        fixed_ret_arr: np.ndarray,
-        sample_t_: np.ndarray,
-        indices: np.ndarray,
-        lookback: int,
+        x_edge: np.ndarray,
+        y_ret: np.ndarray,
+        sample_t: np.ndarray,
+        sample_indices: np.ndarray,
+        lookback_bars: int,
     ):
         self.x_node = x_node
-        self.e_feat = e_feat
-        self.y_trade = y_trade_arr
-        self.y_dir = y_dir_arr
-        self.exit_ret = exit_ret_arr
-        self.fixed_ret = fixed_ret_arr
-        self.sample_t = sample_t_
-        self.indices = indices.astype(np.int64)
-        self.lookback = int(lookback)
+        self.x_edge = x_edge
+        self.y_ret = y_ret
+        self.sample_t = sample_t.astype(np.int64)
+        self.sample_indices = sample_indices.astype(np.int64)
+        self.lookback_bars = int(lookback_bars)
 
     def __len__(self) -> int:
-        return int(len(self.indices))
+        return len(self.sample_indices)
 
     def __getitem__(self, i: int):
-        sidx = int(self.indices[i])
-        t = int(self.sample_t[sidx])
-        t0 = t - self.lookback + 1
+        sample_idx = int(self.sample_indices[i])
+        t = int(self.sample_t[sample_idx])
+        start = t - self.lookback_bars + 1
 
-        x_seq = self.x_node[t0: t + 1]
-        e_last = self.e_feat[t]
+        x_seq = self.x_node[start:t + 1]     # [L, N, F]
+        e_last = self.x_edge[t]              # [E, D]
+        y = self.y_ret[t]                    # scalar
 
-        yt = int(self.y_trade[t])
-        yd = int(self.y_dir[t])
-        er_exit = float(self.exit_ret[t])
-        er_fixed = float(self.fixed_ret[t])
+        if not np.isfinite(y):
+            raise RuntimeError(f"Encountered invalid target at t={t}")
 
         return (
             torch.from_numpy(x_seq),
             torch.from_numpy(e_last),
-            torch.tensor(yt, dtype=torch.float32),
-            torch.tensor(yd, dtype=torch.float32),
-            torch.tensor(er_exit, dtype=torch.float32),
-            torch.tensor(er_fixed, dtype=torch.float32),
-            torch.tensor(sidx, dtype=torch.long),
+            torch.tensor(float(y), dtype=torch.float32),
+            torch.tensor(sample_idx, dtype=torch.long),
         )
 
 
-def collate_fn_twohead(batch):
-    xs, e_last, ytr, ydir, er_exit, er_fixed, sidxs = zip(*batch)
+def temporal_graph_collate(batch):
+    x_seq, e_last, y, sample_idx = zip(*batch)
     return (
-        torch.stack(xs, 0),
-        torch.stack(e_last, 0),
-        torch.stack(ytr, 0),
-        torch.stack(ydir, 0),
-        torch.stack(er_exit, 0),
-        torch.stack(er_fixed, 0),
-        torch.stack(sidxs, 0),
+        torch.stack(x_seq, dim=0),
+        torch.stack(e_last, dim=0),
+        torch.stack(y, dim=0),
+        torch.stack(sample_idx, dim=0),
     )
 
-
-def make_weighted_sampler_trade(y_trade_np: np.ndarray) -> WeightedRandomSampler:
-    y = np.asarray(y_trade_np, dtype=np.int64)
-    counts = np.bincount(y, minlength=2).astype(np.float64)
-    counts = np.maximum(counts, 1.0)
-    w = counts.sum() / (2.0 * counts)
-    sample_w = w[y].astype(np.float64)
-    return WeightedRandomSampler(torch.tensor(sample_w, dtype=torch.double), num_samples=len(sample_w), replacement=True)
-
-
-def fit_scale_nodes_train_only(
-    x_node_raw_: np.ndarray,
-    sample_t_: np.ndarray,
-    idx_train: np.ndarray,
-    max_abs: float,
-) -> Tuple[np.ndarray, Dict[str, Any]]:
-    last_train_t = int(sample_t_[int(idx_train[-1])])
-    train_time_mask = np.arange(0, last_train_t + 1)
-
-    x_train_time = x_node_raw_[train_time_mask]
-    _, _, f_dim = x_train_time.shape
-
-    scaler = RobustScaler(with_centering=True, with_scaling=True, quantile_range=(5.0, 95.0))
-    scaler.fit(x_train_time.reshape(-1, f_dim))
-
-    x_scaled = scaler.transform(x_node_raw_.reshape(-1, f_dim)).reshape(x_node_raw_.shape).astype(np.float32)
-    x_scaled = np.clip(x_scaled, -max_abs, max_abs).astype(np.float32)
-    x_scaled = np.nan_to_num(x_scaled, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
-
-    params = {
-        "center_": scaler.center_.astype(np.float32),
-        "scale_": scaler.scale_.astype(np.float32),
-        "max_abs": float(max_abs),
-    }
-    return x_scaled, params
-
-
-def fit_scale_edges_train_only(
-    e_raw_: np.ndarray,
-    sample_t_: np.ndarray,
-    idx_train: np.ndarray,
-    max_abs: float,
-) -> Tuple[np.ndarray, Dict[str, Any]]:
-    last_train_t = int(sample_t_[int(idx_train[-1])])
-    train_time_mask = np.arange(0, last_train_t + 1)
-
-    e_train_time = e_raw_[train_time_mask]
-    _, _, d_dim = e_train_time.shape
-
-    scaler = RobustScaler(with_centering=True, with_scaling=True, quantile_range=(5.0, 95.0))
-    scaler.fit(e_train_time.reshape(-1, d_dim))
-
-    e_scaled = scaler.transform(e_raw_.reshape(-1, d_dim)).reshape(e_raw_.shape).astype(np.float32)
-    e_scaled = np.clip(e_scaled, -max_abs, max_abs).astype(np.float32)
-    e_scaled = np.nan_to_num(e_scaled, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
-
-    params = {
-        "center_": scaler.center_.astype(np.float32),
-        "scale_": scaler.scale_.astype(np.float32),
-        "max_abs": float(max_abs),
-    }
-    return e_scaled, params
-
-
-def apply_scaler_params(x: np.ndarray, params: Dict[str, Any]) -> np.ndarray:
-    center = np.asarray(params["center_"], dtype=np.float32)
-    scale = np.asarray(params["scale_"], dtype=np.float32)
-    max_abs = float(params["max_abs"])
-    x2 = (x - center) / (scale + 1e-12)
-    x2 = np.clip(x2, -max_abs, max_abs)
-    return np.nan_to_num(x2, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
-
-
-def split_trade_ratio(indices: np.ndarray, sample_t_: np.ndarray, y_trade_arr: np.ndarray) -> float:
-    tt = sample_t_[indices]
-    return float(y_trade_arr[tt].mean()) if len(tt) else float("nan")
-
 # %% [markdown]
-# # Step 7: Attention-based spatio-temporal graph model
+# ## Scaling utilities
 #
-# This cell replaces the temporal TCN stack with an attention-based temporal
-# encoder. Each node sequence is projected into a shared embedding space,
-# enriched with positional embeddings, and encoded with a Transformer encoder.
-#
-# After temporal encoding, the final embedding of each node is passed through a
-# graph propagation stack. The graph support is still a learned mixture of:
-# - a static adjacency,
-# - a prior adjacency built from the latest edge features,
-# - an adaptive adjacency learned directly from node embeddings.
-#
-# The output heads remain multi-task and target only the selected node.
+# The scaler is fit only on timestamps that belong to the training region for each fold.
+# Because the model uses lookback windows, fitting on all timestamps up to the last train time
+# is leakage-safe and matches what would be available at training time.
 
 # %%
-def build_static_adjacency_from_edges(edge_index: torch.Tensor, n_nodes: int, eps: float = 1e-8) -> torch.Tensor:
-    a = torch.zeros((n_nodes, n_nodes), dtype=torch.float32)
-    src = edge_index[:, 0].long()
-    dst = edge_index[:, 1].long()
-    a[src, dst] = 1.0
-    a = a / (a.sum(dim=-1, keepdim=True) + eps)
-    return a
+def fit_robust_scaler_train_only(
+    raw_array: np.ndarray,
+    sample_t: np.ndarray,
+    train_sample_indices: np.ndarray,
+    max_abs_value: float,
+    q_low: float,
+    q_high: float,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    if raw_array.ndim != 3:
+        raise ValueError(f"Expected 3D array, got shape={raw_array.shape}")
+
+    last_train_t = int(sample_t[int(train_sample_indices[-1])])
+    train_slice = raw_array[: last_train_t + 1]
+    flat_train = train_slice.reshape(-1, raw_array.shape[-1])
+
+    scaler = RobustScaler(
+        with_centering=True,
+        with_scaling=True,
+        quantile_range=(float(q_low), float(q_high)),
+    )
+    scaler.fit(flat_train)
+
+    flat_all = raw_array.reshape(-1, raw_array.shape[-1])
+    scaled_all = scaler.transform(flat_all).reshape(raw_array.shape).astype(np.float32)
+    scaled_all = np.clip(scaled_all, -float(max_abs_value), float(max_abs_value))
+    scaled_all = np.nan_to_num(scaled_all, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+    params = {
+        "center_": scaler.center_.astype(np.float32),
+        "scale_": scaler.scale_.astype(np.float32),
+        "max_abs_value": float(max_abs_value),
+    }
+    return scaled_all, params
 
 
-def build_adj_prior_from_edge_attr(
-    edge_attr_last: torch.Tensor,
-    edge_index: torch.Tensor,
-    n_nodes: int,
-    use_abs: bool,
-    diag_boost: float,
-    row_normalize: bool,
-    eps: float = 1e-8,
-) -> torch.Tensor:
-    edge_attr_last = torch.nan_to_num(edge_attr_last, nan=0.0, posinf=0.0, neginf=0.0)
-    bsz, _, _ = edge_attr_last.shape
-    r = edge_attr_last.mean(dim=-1)
-    if use_abs:
-        r = r.abs()
-    w = torch.sigmoid(r)
+def apply_robust_scaler_params(raw_array: np.ndarray, params: Dict[str, Any]) -> np.ndarray:
+    center = np.asarray(params["center_"], dtype=np.float32)
+    scale = np.asarray(params["scale_"], dtype=np.float32)
+    max_abs_value = float(params["max_abs_value"])
 
-    a = torch.zeros((bsz, n_nodes, n_nodes), device=edge_attr_last.device, dtype=edge_attr_last.dtype)
-    src = edge_index[:, 0].to(edge_attr_last.device)
-    dst = edge_index[:, 1].to(edge_attr_last.device)
-    a[:, src, dst] = w
+    flat = raw_array.reshape(-1, raw_array.shape[-1]).astype(np.float32)
+    flat = (flat - center) / (scale + 1e-12)
+    flat = np.clip(flat, -max_abs_value, max_abs_value)
+    flat = np.nan_to_num(flat, nan=0.0, posinf=0.0, neginf=0.0)
+    return flat.reshape(raw_array.shape).astype(np.float32)
 
-    diag = torch.arange(n_nodes, device=edge_attr_last.device)
-    a[:, diag, diag] = torch.maximum(a[:, diag, diag], torch.full_like(a[:, diag, diag], float(diag_boost)))
+# %% [markdown]
+# ## Model definition
+#
+# Honest naming:
+# - this is **not** graph attention
+# - temporal part = **causal Transformer encoder**
+# - graph part = **support-mixed graph propagation**
+#
+# The dynamic adjacency uses the **last edge feature snapshot only**.
 
-    if row_normalize:
-        a = a / (a.sum(dim=-1, keepdim=True) + eps)
-
-    return torch.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
-
-
-class AdaptiveAdjacency(nn.Module):
-    def __init__(self, n_nodes: int, cfg: Dict[str, Any]):
-        super().__init__()
-        self.n = int(n_nodes)
-        k = int(cfg.get("adj_emb_dim", 8))
-        self.e1 = nn.Parameter(0.01 * torch.randn(self.n, k))
-        self.e2 = nn.Parameter(0.01 * torch.randn(self.n, k))
-        temp = float(cfg.get("adj_temperature", 1.0))
-        self.temp = max(temp, 1e-3)
-        self.topk = int(cfg.get("adaptive_topk", self.n))
-
-    def forward(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        logits = (self.e1 @ self.e2.t())
-        logits = F.relu(logits) / self.temp
-
-        if 0 < self.topk < self.n:
-            vals, idx = torch.topk(logits, k=self.topk, dim=-1)
-            masked = torch.full_like(logits, fill_value=float("-inf"))
-            masked.scatter_(-1, idx, vals)
-            logits = masked
-
-        a = torch.softmax(logits, dim=-1)
-        sparsity_proxy = torch.sigmoid(torch.nan_to_num(logits, nan=0.0, neginf=-30.0, posinf=30.0))
-        return a, sparsity_proxy, logits
-
-
-class LearnableSupportMix(nn.Module):
-    def __init__(self, n_supports: int = 3):
-        super().__init__()
-        self.w_logits = nn.Parameter(torch.zeros(n_supports, dtype=torch.float32))
-
-    def forward(self) -> torch.Tensor:
-        return torch.softmax(self.w_logits, dim=0)
-
-
-class GraphPropagationBlock(nn.Module):
+# %%
+class GraphPropagationLayer(nn.Module):
     def __init__(self, hidden_dim: int, dropout: float):
         super().__init__()
         self.self_lin = nn.Linear(hidden_dim, hidden_dim)
         self.msg_lin = nn.Linear(hidden_dim, hidden_dim)
-        self.norm = nn.LayerNorm(hidden_dim)
         self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(hidden_dim)
 
-    def forward(self, h: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
-        msg = torch.einsum("bnm,bmd->bnd", a, h)
-        update = self.self_lin(h) + self.msg_lin(msg)
-        update = F.gelu(update)
-        update = self.dropout(update)
-        return self.norm(h + update)
+    def forward(self, h: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
+        # h: [B, N, H]
+        # adj: [B, N, N]
+        msg = torch.einsum("bij,bjh->bih", adj, h)
+        out = self.self_lin(h) + self.msg_lin(msg)
+        out = F.gelu(out)
+        out = self.dropout(out)
+        return self.norm(h + out)
 
 
-class AttentionGraphTwoHeadFixedH(nn.Module):
-    """
-    Input:
-      x_seq:  (B, L, N, F)
-      e_last: (B, E, D)
-
-    Output (target node):
-      trade_logit: (B,)
-      dir_logit:   (B,)
-      fixed_hat:   (B,)
-    """
-
-    def __init__(self, node_in: int, edge_dim: int, cfg: Dict[str, Any], n_nodes: int, target_node: int):
+class TemporalGraphBaseline(nn.Module):
+    def __init__(
+        self,
+        node_dim: int,
+        edge_dim: int,
+        n_nodes: int,
+        target_node: int,
+        lookback_bars: int,
+        cfg: Dict[str, Any],
+    ):
         super().__init__()
-        del edge_dim
-        self.cfg = cfg
+        hidden_dim = int(cfg["hidden_dim"])
+        num_heads = int(cfg["transformer_heads"])
+        num_layers = int(cfg["transformer_layers"])
+        ff_mult = int(cfg["transformer_ff_mult"])
+        graph_layers = int(cfg["graph_layers"])
+        edge_hidden_dim = int(cfg["edge_hidden_dim"])
+        adaptive_adj_dim = int(cfg["adaptive_adj_dim"])
+        dropout = float(cfg["dropout"])
+
+        if hidden_dim % num_heads != 0:
+            raise ValueError("hidden_dim must be divisible by transformer_heads")
+
         self.n_nodes = int(n_nodes)
         self.target_node = int(target_node)
-        self.lookback = int(cfg["lookback"])
+        self.lookback_bars = int(lookback_bars)
 
-        model_dim = int(cfg["attn_model_dim"])
-        heads = int(cfg["attn_num_heads"])
-        layers = int(cfg["attn_num_layers"])
-        ff_mult = int(cfg.get("attn_ff_mult", 4))
-        dropout = float(cfg.get("dropout", 0.0))
-        graph_layers = int(cfg.get("graph_num_layers", 2))
+        self.node_proj = nn.Linear(node_dim, hidden_dim)
+        self.pos_emb = nn.Parameter(torch.zeros(1, self.lookback_bars, hidden_dim))
 
-        self.node_proj = nn.Linear(int(node_in), model_dim)
-        self.pos_emb = nn.Parameter(torch.zeros(1, self.lookback, 1, model_dim))
-
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model=model_dim,
-            nhead=heads,
-            dim_feedforward=ff_mult * model_dim,
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=num_heads,
+            dim_feedforward=ff_mult * hidden_dim,
             dropout=dropout,
             activation="gelu",
             batch_first=True,
-            norm_first=True,
+            norm_first=False,
         )
-        self.temporal_encoder = nn.TransformerEncoder(enc_layer, num_layers=layers)
+        self.temporal_encoder = nn.TransformerEncoder(
+            encoder_layer=encoder_layer,
+            num_layers=num_layers,
+        )
 
-        a_static = build_static_adjacency_from_edges(EDGE_INDEX, n_nodes=self.n_nodes)
-        self.register_buffer("a_static", a_static)
+        self.edge_mlp = nn.Sequential(
+            nn.Linear(edge_dim, edge_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(edge_hidden_dim, 1),
+        )
 
-        self.adapt = AdaptiveAdjacency(n_nodes=self.n_nodes, cfg=cfg)
-        self.support_mix = LearnableSupportMix(n_supports=3)
-        self.graph_blocks = nn.ModuleList([GraphPropagationBlock(model_dim, dropout) for _ in range(graph_layers)])
+        self.adaptive_src = nn.Parameter(torch.randn(self.n_nodes, adaptive_adj_dim) * 0.02)
+        self.adaptive_dst = nn.Parameter(torch.randn(self.n_nodes, adaptive_adj_dim) * 0.02)
 
-        self.end_norm = nn.LayerNorm(model_dim)
-        self.trade_head = nn.Linear(model_dim, 1)
-        self.dir_head = nn.Linear(model_dim, 1)
-        self.fixed_head = nn.Linear(model_dim, 1)
+        # Support mix:
+        # 0 = identity/self support
+        # 1 = dynamic edge-conditioned support
+        # 2 = learned adaptive support
+        self.support_logits = nn.Parameter(torch.zeros(3, dtype=torch.float32))
+
+        self.graph_layers = nn.ModuleList(
+            [GraphPropagationLayer(hidden_dim, dropout) for _ in range(graph_layers)]
+        )
+
+        self.head = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+
+        identity_adj = torch.eye(self.n_nodes, dtype=torch.float32)
+        self.register_buffer("identity_adj", identity_adj)
+
+        allowed_mask = torch.zeros(self.n_nodes, self.n_nodes, dtype=torch.float32)
+        for src, dst in EDGE_INDEX.tolist():
+            allowed_mask[src, dst] = 1.0
+        self.register_buffer("allowed_mask", allowed_mask)
 
         nn.init.trunc_normal_(self.pos_emb, std=0.02)
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
 
-    def _compute_supports(self, e_last: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, Any]]:
-        e_last = torch.nan_to_num(e_last, nan=0.0, posinf=0.0, neginf=0.0)
-        bsz, _, _ = e_last.shape
-
-        a_prior = build_adj_prior_from_edge_attr(
-            edge_attr_last=e_last,
-            edge_index=EDGE_INDEX.to(e_last.device),
-            n_nodes=self.n_nodes,
-            use_abs=bool(self.cfg.get("prior_use_abs", False)),
-            diag_boost=float(self.cfg.get("prior_diag_boost", 1.0)),
-            row_normalize=bool(self.cfg.get("prior_row_normalize", True)),
+    def _causal_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        # True entries are masked.
+        return torch.triu(
+            torch.ones(seq_len, seq_len, dtype=torch.bool, device=device),
+            diagonal=1,
         )
 
-        a_adapt_base, sparsity_proxy, _ = self.adapt()
-        a_adapt = a_adapt_base.unsqueeze(0).expand(bsz, -1, -1)
+    def _dynamic_adjacency(self, edge_last: torch.Tensor) -> torch.Tensor:
+        # edge_last: [B, E, D]
+        bsz = edge_last.size(0)
+        edge_logits = self.edge_mlp(edge_last).squeeze(-1)         # [B, E]
+        edge_weights = F.softplus(edge_logits) + 1e-6              # positive weights
 
-        w = self.support_mix()
-        a_static = self.a_static.to(e_last.device).to(e_last.dtype).unsqueeze(0).expand(bsz, -1, -1)
-        a_mix = w[0] * a_static + w[1] * a_prior + w[2] * a_adapt
-        a_mix = a_mix / (a_mix.sum(dim=-1, keepdim=True) + 1e-8)
+        adj = edge_last.new_zeros((bsz, self.n_nodes, self.n_nodes))
+        src_idx = EDGE_INDEX[:, 0].to(edge_last.device)
+        dst_idx = EDGE_INDEX[:, 1].to(edge_last.device)
+        adj[:, src_idx, dst_idx] = edge_weights
 
-        n = self.n_nodes
-        offdiag = (1.0 - torch.eye(n, device=e_last.device, dtype=e_last.dtype))
-        l1_off = (sparsity_proxy.to(e_last.dtype) * offdiag).abs().mean()
-        mse_prior = ((a_adapt - a_prior) ** 2 * offdiag).mean()
+        # Mask to allowed edges and row-normalize.
+        adj = adj * self.allowed_mask.to(edge_last.device)
+        adj = adj / adj.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        return adj
 
-        aux = {
-            "support_w": w.detach().cpu().numpy().tolist(),
-            "_l1_off_t": l1_off,
-            "_mse_prior_t": mse_prior,
-        }
-        return a_mix, aux
+    def _adaptive_adjacency(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        logits = self.adaptive_src @ self.adaptive_dst.T
+        logits = logits.masked_fill(self.allowed_mask.to(device) == 0.0, float("-inf"))
+        adj = torch.softmax(logits, dim=-1)
+        return adj.unsqueeze(0).expand(batch_size, -1, -1)
 
-    def forward(self, x_seq: torch.Tensor, e_last: torch.Tensor, return_aux: bool = False):
+    def forward(self, x_seq: torch.Tensor, edge_last: torch.Tensor) -> torch.Tensor:
+        # x_seq: [B, L, N, F]
+        # edge_last: [B, E, D]
+        bsz, seq_len, n_nodes, node_dim = x_seq.shape
+        assert n_nodes == self.n_nodes, f"Expected {self.n_nodes} nodes, got {n_nodes}"
+
         x_seq = torch.nan_to_num(x_seq, nan=0.0, posinf=0.0, neginf=0.0)
-        e_last = torch.nan_to_num(e_last, nan=0.0, posinf=0.0, neginf=0.0)
+        edge_last = torch.nan_to_num(edge_last, nan=0.0, posinf=0.0, neginf=0.0)
 
-        bsz, seq_len, n_nodes, _ = x_seq.shape
-        assert n_nodes == self.n_nodes
-        if seq_len > self.lookback:
-            raise ValueError(f"Sequence length {seq_len} exceeds configured lookback {self.lookback}")
-
-        h = self.node_proj(x_seq)
-        h = h + self.pos_emb[:, :seq_len]
-
+        h = self.node_proj(x_seq)  # [B, L, N, H]
         h = h.permute(0, 2, 1, 3).contiguous().view(bsz * n_nodes, seq_len, -1)
-        h = self.temporal_encoder(h)
-        h_last = h[:, -1, :].view(bsz, n_nodes, -1)
+        h = h + self.pos_emb[:, :seq_len, :]
 
-        a_mix, aux = self._compute_supports(e_last)
-        for block in self.graph_blocks:
-            h_last = block(h_last, a_mix)
+        causal_mask = self._causal_mask(seq_len=seq_len, device=x_seq.device)
+        h = self.temporal_encoder(h, mask=causal_mask)
+        h_last = h[:, -1, :].view(bsz, n_nodes, -1)  # [B, N, H]
 
-        feat = self.end_norm(h_last[:, self.target_node, :])
-        trade_logit = self.trade_head(feat).squeeze(-1)
-        dir_logit = self.dir_head(feat).squeeze(-1)
-        fixed_hat = self.fixed_head(feat).squeeze(-1)
+        adj_dynamic = self._dynamic_adjacency(edge_last)
+        adj_adaptive = self._adaptive_adjacency(batch_size=bsz, device=x_seq.device)
+        adj_identity = self.identity_adj.to(x_seq.device).unsqueeze(0).expand(bsz, -1, -1)
 
-        trade_logit = torch.nan_to_num(trade_logit, nan=0.0, posinf=0.0, neginf=0.0)
-        dir_logit = torch.nan_to_num(dir_logit, nan=0.0, posinf=0.0, neginf=0.0)
-        fixed_hat = torch.nan_to_num(fixed_hat, nan=0.0, posinf=0.0, neginf=0.0)
+        support_mix = torch.softmax(self.support_logits, dim=0)
+        adj = (
+            support_mix[0] * adj_identity
+            + support_mix[1] * adj_dynamic
+            + support_mix[2] * adj_adaptive
+        )
+        adj = adj / adj.sum(dim=-1, keepdim=True).clamp_min(1e-6)
 
-        if return_aux:
-            return trade_logit, dir_logit, fixed_hat, aux
-        return trade_logit, dir_logit, fixed_hat
+        for layer in self.graph_layers:
+            h_last = layer(h_last, adj)
+
+        eth_repr = h_last[:, self.target_node, :]
+        pred = self.head(eth_repr).squeeze(-1)
+        pred = torch.nan_to_num(pred, nan=0.0, posinf=0.0, neginf=0.0)
+        return pred
 
 # %% [markdown]
-# # Step 8: Metrics, thresholding, and multi-task loss
-#
-# This cell contains the training objective and the trading-oriented evaluation
-# helpers. The two-head classifier outputs are converted into a 3-class
-# probability view so thresholds can still be selected in the same way as in the
-# original notebook.
-#
-# The loss combines four terms:
-# - trade BCE,
-# - direction BCE on true trades,
-# - Huber loss for the fixed-horizon return,
-# - a soft utility term that rewards good directional exposure.
+# ## Loss, prediction, and evaluation helpers
 
 # %%
-def _safe_auc_binary(y_true: np.ndarray, score: np.ndarray) -> float:
-    y_true = np.asarray(y_true, dtype=np.int64)
-    score = np.asarray(score, dtype=np.float64)
-    if y_true.size == 0 or len(np.unique(y_true)) < 2:
+def regression_loss(pred: torch.Tensor, target: torch.Tensor, cfg: Dict[str, Any]) -> torch.Tensor:
+    beta = float(cfg["huber_beta"])
+    return F.smooth_l1_loss(pred.view(-1), target.view(-1), beta=beta)
+
+
+def rmse_np(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    y_true = np.asarray(y_true, dtype=np.float64)
+    y_pred = np.asarray(y_pred, dtype=np.float64)
+    return float(np.sqrt(np.mean((y_true - y_pred) ** 2))) if len(y_true) else float("nan")
+
+
+def mae_np(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    y_true = np.asarray(y_true, dtype=np.float64)
+    y_pred = np.asarray(y_pred, dtype=np.float64)
+    return float(np.mean(np.abs(y_true - y_pred))) if len(y_true) else float("nan")
+
+
+def ic_np(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    y_true = np.asarray(y_true, dtype=np.float64)
+    y_pred = np.asarray(y_pred, dtype=np.float64)
+    if len(y_true) == 0:
         return float("nan")
-    return float(roc_auc_score(y_true, score))
+    if np.std(y_true) <= 1e-12 or np.std(y_pred) <= 1e-12:
+        return float("nan")
+    return float(np.corrcoef(y_true, y_pred)[0, 1])
+
+
+def safe_roc_auc(y_true_binary: np.ndarray, score: np.ndarray) -> float:
+    y_true_binary = np.asarray(y_true_binary)
+    score = np.asarray(score, dtype=np.float64)
+    mask = np.isfinite(y_true_binary) & np.isfinite(score)
+    y = y_true_binary[mask]
+    s = score[mask]
+    if len(y) == 0 or len(np.unique(y)) < 2:
+        return float("nan")
+    try:
+        return float(roc_auc_score(y, s))
+    except Exception:
+        return float("nan")
 
 
-def probs3_from_twohead(p_trade: np.ndarray, p_dir: np.ndarray) -> np.ndarray:
-    p_trade = np.asarray(p_trade, dtype=np.float64)
-    p_dir = np.asarray(p_dir, dtype=np.float64)
-    p_flat = 1.0 - p_trade
-    p_long = p_trade * p_dir
-    p_short = p_trade * (1.0 - p_dir)
-    prob3 = np.stack([p_short, p_flat, p_long], axis=1)
-    prob3 = np.clip(prob3, 1e-12, 1.0)
-    prob3 = prob3 / prob3.sum(axis=1, keepdims=True)
-    return prob3
-
-
-def compute_trade_dir_auc_from_twohead(
-    y_trade_true: np.ndarray,
-    y_tb_true: np.ndarray,
-    p_trade: np.ndarray,
-    p_dir: np.ndarray,
-) -> Tuple[float, float]:
-    y_trade_true = np.asarray(y_trade_true, dtype=np.int64)
-    y_tb_true = np.asarray(y_tb_true, dtype=np.int64)
-    p_trade = np.asarray(p_trade, dtype=np.float64)
-    p_dir = np.asarray(p_dir, dtype=np.float64)
-
-    trade_auc = _safe_auc_binary(y_trade_true, p_trade)
-
-    mask_trade = (y_tb_true != 1)
-    y_dir_bin = (y_tb_true[mask_trade] == 2).astype(np.int64)
-    dir_auc = _safe_auc_binary(y_dir_bin, p_dir[mask_trade])
-
-    return trade_auc, dir_auc
-
-
-def pnl_from_probs_3class(
-    prob3: np.ndarray,
-    exit_ret_arr: np.ndarray,
-    thr_trade: float,
-    thr_dir: float,
-    cost_bps: float,
-) -> Dict[str, Any]:
-    prob3 = np.asarray(prob3, dtype=np.float64)
-    exit_ret_arr = np.asarray(exit_ret_arr, dtype=np.float64)
-
-    p_short = prob3[:, 0]
-    p_flat = prob3[:, 1]
-    p_long = prob3[:, 2]
-
-    trade_conf = 1.0 - p_flat
-    dir_prob = p_long / (p_long + p_short + 1e-12)
-    dir_conf = np.maximum(dir_prob, 1.0 - dir_prob)
-
-    mask = (trade_conf >= float(thr_trade)) & (dir_conf >= float(thr_dir))
-
-    action = np.zeros_like(exit_ret_arr, dtype=np.float64)
-    action[mask] = np.where(dir_prob[mask] >= 0.5, 1.0, -1.0)
-
-    cost = (float(cost_bps) * 1e-4) * mask.astype(np.float64)
-    pnl = action * exit_ret_arr - cost
-
-    n = int(len(exit_ret_arr))
-    n_tr = int(mask.sum())
-
-    return {
-        "n": n,
-        "n_trades": n_tr,
-        "trade_rate": float(n_tr / max(1, n)),
-        "pnl_sum": float(pnl.sum()),
-        "pnl_mean": float(pnl.mean()) if n else float("nan"),
-        "pnl_per_trade": float(pnl.sum() / max(1, n_tr)),
-    }
-
-
-def build_trade_threshold_grid(
-    p_trade: np.ndarray,
-    base_grid: Optional[List[float]],
-    target_trades_list: Optional[List[int]],
-) -> List[float]:
-    p_trade = np.asarray(p_trade, dtype=np.float64)
-    p_trade = p_trade[np.isfinite(p_trade)]
-    if p_trade.size == 0:
-        return base_grid or [0.5]
-
-    thrs = set(float(t) for t in (base_grid or []))
-
-    if target_trades_list:
-        n = int(p_trade.size)
-        for k in target_trades_list:
-            k = int(k)
-            if k <= 0:
-                continue
-            if k >= n:
-                thr = float(np.min(p_trade))
-            else:
-                q = 1.0 - (k / n)
-                thr = float(np.quantile(p_trade, q))
-            thrs.add(float(np.clip(thr, 0.01, 0.99)))
-
-    out = sorted(thrs)
-    cleaned = []
-    for t in out:
-        if not cleaned or abs(t - cleaned[-1]) > 1e-6:
-            cleaned.append(float(t))
-    return cleaned
-
-
-def sweep_thresholds_3class(
-    prob3: np.ndarray,
-    exit_ret_arr: np.ndarray,
-    cfg: Dict[str, Any],
-    min_trades: int,
-    target_trade_rate: Optional[float],
-) -> pd.DataFrame:
-    prob3 = np.asarray(prob3, dtype=np.float64)
-    p_trade = 1.0 - prob3[:, 1]
-
-    thr_trade_grid = build_trade_threshold_grid(
-        p_trade=p_trade,
-        base_grid=cfg.get("thr_trade_grid", [0.5]),
-        target_trades_list=cfg.get("proxy_target_trades", None),
-    )
-    thr_dir_grid = cfg.get("thr_dir_grid", [0.5])
-
-    obj = str(cfg.get("thr_objective", "pnl_sum"))
-    max_rate = cfg.get("max_trade_rate_val", None)
-    penalty = float(cfg.get("trade_rate_penalty", 0.0))
-
-    def _collect_rows(local_min_trades: int, local_max_rate: Optional[float]) -> List[Dict[str, Any]]:
-        rows_local = []
-        for thr_t in thr_trade_grid:
-            for thr_d in thr_dir_grid:
-                m = pnl_from_probs_3class(prob3, exit_ret_arr, thr_t, thr_d, cfg["cost_bps"])
-                if int(m["n_trades"]) < int(local_min_trades):
-                    continue
-                if local_max_rate is not None and float(m["trade_rate"]) > float(local_max_rate):
-                    continue
-
-                base = float(m.get(obj, np.nan))
-                if not np.isfinite(base):
-                    continue
-
-                if target_trade_rate is not None:
-                    score = base - penalty * abs(float(m["trade_rate"]) - float(target_trade_rate))
-                else:
-                    score = base - penalty * float(m["trade_rate"])
-
-                rows_local.append({"thr_trade": float(thr_t), "thr_dir": float(thr_d), "score": float(score), **m})
-        return rows_local
-
-    rows = _collect_rows(local_min_trades=int(min_trades), local_max_rate=max_rate)
-    if not rows:
-        rows = _collect_rows(local_min_trades=1, local_max_rate=None)
-    if not rows:
-        return pd.DataFrame(columns=["thr_trade", "thr_dir", "score", "n", "n_trades", "trade_rate", "pnl_sum", "pnl_mean", "pnl_per_trade"])
-
-    return pd.DataFrame(rows).sort_values(["score", "pnl_sum"], ascending=False)
-
-
-def total_loss_with_adj_reg(loss: torch.Tensor, aux: Dict[str, Any], cfg: Dict[str, Any]) -> torch.Tensor:
-    lam_l1 = float(cfg.get("adj_l1_lambda", 0.0))
-    lam_pr = float(cfg.get("adj_prior_lambda", 0.0))
-    reg = 0.0
-    if lam_l1 > 0:
-        reg = reg + lam_l1 * aux["_l1_off_t"]
-    if lam_pr > 0:
-        reg = reg + lam_pr * aux["_mse_prior_t"]
-    return loss + reg
-
-
-def compute_pos_weights_binary(y: np.ndarray) -> torch.Tensor:
-    y = np.asarray(y, dtype=np.int64)
-    n_pos = float((y == 1).sum())
-    n_neg = float((y == 0).sum())
-    n_pos = max(n_pos, 1.0)
-    return torch.tensor([n_neg / n_pos], dtype=torch.float32, device=DEVICE)
-
-
-def multitask_loss_twohead_fixedH(
-    trade_logit: torch.Tensor,
-    dir_logit: torch.Tensor,
-    fixed_hat: torch.Tensor,
-    y_trade_: torch.Tensor,
-    y_dir_: torch.Tensor,
-    fixed_ret_: torch.Tensor,
-    bce_trade_fn: nn.Module,
-    bce_dir_fn: nn.Module,
-    cfg: Dict[str, Any],
-) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    trade_logit = trade_logit.reshape(-1)
-    dir_logit = dir_logit.reshape(-1)
-    fixed_hat = fixed_hat.reshape(-1)
-    y_trade_ = y_trade_.reshape(-1)
-    y_dir_ = y_dir_.reshape(-1)
-    fixed_ret_ = fixed_ret_.reshape(-1)
-
-    device = trade_logit.device
-    dtype = trade_logit.dtype
-
-    def _cfg_float(key: str, default: float) -> float:
-        v = cfg.get(key, default)
-        return float(v) if v is not None else float(default)
-
-    w_t = _cfg_float("loss_w_trade", 1.0)
-    w_d = _cfg_float("loss_w_dir", 1.0)
-    w_r = _cfg_float("loss_w_ret", 1.0)
-    w_u = _cfg_float("loss_w_utility", 1.0)
-
-    bce_t = bce_trade_fn(trade_logit, y_trade_.to(dtype=torch.float32))
-
-    mask_t = (y_trade_ == 1)
-    if mask_t.any():
-        bce_d = bce_dir_fn(dir_logit[mask_t], y_dir_[mask_t].to(dtype=torch.float32))
-    else:
-        bce_d = torch.zeros((), device=device, dtype=dtype)
-
-    clip_val = _cfg_float("fixed_ret_clip", 0.0)
-    fr = fixed_ret_.to(dtype=fixed_hat.dtype)
-    if clip_val > 0:
-        fr = torch.clamp(fr, -clip_val, clip_val)
-
-    delta = _cfg_float("ret_huber_delta", 0.01)
-    huber = F.huber_loss(fixed_hat, fr, delta=delta, reduction="mean")
-
-    p_trade = torch.sigmoid(trade_logit)
-    k = _cfg_float("utility_k", 2.0)
-    soft_dir = torch.tanh(k * dir_logit)
-    pos = p_trade * soft_dir
-
-    fee = _cfg_float("cost_bps", 0.0) * 1e-4
-    utility_vec = pos * fr - fee * pos.abs()
-
-    utility_mask_true_trades = bool(cfg.get("utility_mask_true_trades", False))
-    if utility_mask_true_trades:
-        if mask_t.any():
-            util = utility_vec[mask_t].mean()
-        else:
-            util = torch.zeros((), device=device, dtype=dtype)
-    else:
-        util = utility_vec.mean()
-
-    util_scale = _cfg_float("utility_scale", 1.0)
-    util_s = util_scale * util
-    util_loss = -util_s
-
-    total = (w_t * bce_t) + (w_d * bce_d) + (w_r * huber) + (w_u * util_loss)
-
-    if mask_t.any():
-        util_true_t = utility_vec[mask_t].mean()
-        pos_abs_true_t = pos[mask_t].abs().mean()
-        p_t_mean_true_t = p_trade[mask_t].mean()
-    else:
-        util_true_t = torch.zeros((), device=device, dtype=dtype)
-        pos_abs_true_t = torch.zeros((), device=device, dtype=dtype)
-        p_t_mean_true_t = torch.zeros((), device=device, dtype=dtype)
-
-    parts = {
-        "bce_trade": bce_t.detach(),
-        "bce_dir": bce_d.detach(),
-        "huber": huber.detach(),
-        "util": util.detach(),
-        "util_scaled": util_s.detach(),
-        "util_true_trades": util_true_t.detach(),
-        "pos_abs_true_trades": pos_abs_true_t.detach(),
-        "p_trade_mean_true_trades": p_t_mean_true_t.detach(),
-        "pos_abs": pos.abs().mean().detach(),
-        "p_trade_mean": p_trade.mean().detach(),
-    }
-    return total, parts
-
-# %% [markdown]
-# # Step 8.5: Threshold-pairs check utilities
-#
-# This cell keeps the diagnostic threshold-sweep utilities used after CV and
-# after the production refit. The functions evaluate many threshold pairs in a
-# single table and optionally save the results as CSV artifacts.
-
-# %%
-def _normalize_pairs_list(pairs: Any) -> List[Tuple[float, float]]:
-    out: List[Tuple[float, float]] = []
-    if pairs is None:
-        return out
-    if isinstance(pairs, (list, tuple)):
-        for p in pairs:
-            if not isinstance(p, (list, tuple)) or len(p) != 2:
-                continue
-            try:
-                out.append((float(p[0]), float(p[1])))
-            except Exception:
-                continue
-    return out
-
-
-def build_threshold_pairs_for_check(prob3: np.ndarray, cfg: Dict[str, Any]) -> List[Tuple[float, float]]:
-    prob3 = np.asarray(prob3, dtype=np.float64)
-    p_trade = 1.0 - prob3[:, 1]
-
-    thr_trade_grid = build_trade_threshold_grid(
-        p_trade=p_trade,
-        base_grid=cfg.get("thr_trade_grid", [0.5]),
-        target_trades_list=cfg.get("proxy_target_trades", None),
-    )
-    thr_dir_grid = list(cfg.get("thr_dir_grid", [0.5]))
-
-    pairs = {(float(tt), float(td)) for tt in thr_trade_grid for td in thr_dir_grid}
-    for tt, td in _normalize_pairs_list(cfg.get("thr_pairs_check", [])):
-        pairs.add((float(tt), float(td)))
-
-    return sorted(pairs)
-
-
-def check_threshold_pairs_once(
-    prob3: np.ndarray,
-    exit_ret_arr: np.ndarray,
-    cfg: Dict[str, Any],
-    label: str,
-    min_trades: Optional[int] = None,
-    target_trade_rate: Optional[float] = None,
-    top_k: int = 20,
-    save_csv_path: Optional[Path] = None,
-) -> pd.DataFrame:
-    prob3 = np.asarray(prob3, dtype=np.float64)
-    exit_ret_arr = np.asarray(exit_ret_arr, dtype=np.float64)
-
-    min_trades_eff = int(min_trades) if min_trades is not None else int(cfg.get("eval_min_trades", 1))
-
-    pairs = build_threshold_pairs_for_check(prob3, cfg)
-    thr_trade_vals = sorted({p[0] for p in pairs})
-    thr_dir_vals = sorted({p[1] for p in pairs})
-
-    cfg_tmp = dict(cfg)
-    cfg_tmp["thr_trade_grid"] = thr_trade_vals
-    cfg_tmp["thr_dir_grid"] = thr_dir_vals
-
-    df_tbl = sweep_thresholds_3class(
-        prob3=prob3,
-        exit_ret_arr=exit_ret_arr,
-        cfg=cfg_tmp,
-        min_trades=min_trades_eff,
-        target_trade_rate=target_trade_rate,
-    ).copy()
-
-    cols = ["thr_trade", "thr_dir", "score", "pnl_sum", "pnl_per_trade", "trade_rate", "n_trades", "n"]
-    cols = [c for c in cols if c in df_tbl.columns]
-
-    print("\n" + "=" * 90)
-    print(label)
-    print(f"checked pairs: {len(df_tbl)} | min_trades={min_trades_eff} | target_trade_rate={target_trade_rate}")
-    if len(df_tbl):
-        print(df_tbl[cols].head(int(top_k)).to_string(index=False))
-    else:
-        print("No valid threshold pairs found.")
-
-    if save_csv_path is not None:
-        save_csv_path.parent.mkdir(parents=True, exist_ok=True)
-        df_tbl.to_csv(save_csv_path, index=False)
-        print(f"Saved threshold check table -> {save_csv_path}")
-
-    return df_tbl
-
-
-def check_threshold_pairs_after_cv_once(
-    fold_artifacts: List[Dict[str, Any]],
-    cfg: Dict[str, Any],
-    split: str = "test",
-    top_k: int = 20,
-    save_csv_path: Optional[Path] = None,
-) -> pd.DataFrame:
-    if split not in ("val", "test"):
-        raise ValueError("split must be 'val' or 'test'")
-
-    prob3_all = []
-    exit_all = []
-    for art in fold_artifacts:
-        ev = art["val_eval"] if split == "val" else art["test_eval"]
-        prob3_all.append(np.asarray(ev["prob3"], dtype=np.float64))
-        exit_all.append(np.asarray(ev["exit_ret"], dtype=np.float64))
-
-    prob3_cat = np.concatenate(prob3_all, axis=0) if prob3_all else np.zeros((0, 3), dtype=np.float64)
-    exit_cat = np.concatenate(exit_all, axis=0) if exit_all else np.zeros((0,), dtype=np.float64)
-
-    return check_threshold_pairs_once(
-        prob3=prob3_cat,
-        exit_ret_arr=exit_cat,
-        cfg=cfg,
-        label=f"THRESHOLD CHECK (AFTER CV) | aggregated split={split.upper()} over folds",
-        min_trades=int(cfg.get("eval_min_trades", 1)),
-        target_trade_rate=None,
-        top_k=top_k,
-        save_csv_path=save_csv_path,
-    )
-
-# %% [markdown]
-# # Step 9: Evaluation on arbitrary index sets
-#
-# This cell evaluates a trained model on any subset of sample indices.
-# It builds a dataset and loader, computes the full multi-task loss, aggregates
-# prediction statistics, and returns both raw probabilities and the transformed
-# 3-class representation used by threshold selection.
-
-# %%
 @torch.no_grad()
-def eval_twohead_on_indices(
+def predict_on_indices(
     model: nn.Module,
-    x_scaled: np.ndarray,
-    edge_scaled: np.ndarray,
+    x_node_scaled: np.ndarray,
+    x_edge_scaled: np.ndarray,
     indices: np.ndarray,
-    bce_trade: nn.Module,
-    bce_dir: nn.Module,
-    cfg: Dict[str, Any],
-) -> Dict[str, Any]:
-    ds = LobGraphSequenceDatasetTwoHeadFixedH(
-        x_node=x_scaled,
-        e_feat=edge_scaled,
-        y_trade_arr=y_trade,
-        y_dir_arr=y_dir,
-        exit_ret_arr=exit_ret,
-        fixed_ret_arr=fixed_ret,
-        sample_t_=sample_t,
-        indices=indices.astype(np.int64),
-        lookback=int(cfg["lookback"]),
+    batch_size: int,
+) -> Dict[str, np.ndarray]:
+    ds = TemporalGraphDataset(
+        x_node=x_node_scaled,
+        x_edge=x_edge_scaled,
+        y_ret=Y_RET,
+        sample_t=SAMPLE_T,
+        sample_indices=indices,
+        lookback_bars=LOOKBACK_BARS,
     )
-    loader = DataLoader(ds, batch_size=int(cfg["batch_size"]), shuffle=False, collate_fn=collate_fn_twohead, num_workers=0)
+    loader = DataLoader(
+        ds,
+        batch_size=int(batch_size),
+        shuffle=False,
+        num_workers=0,
+        collate_fn=temporal_graph_collate,
+    )
 
     model.eval()
+    preds, targets, sample_positions = [], [], []
 
-    tot_loss = 0.0
-    tot_tr = 0.0
-    tot_dr = 0.0
-    tot_huber = 0.0
-    tot_util = 0.0
-    tot_util_s = 0.0
-    tot_pos_abs = 0.0
-    tot_ptr = 0.0
-    n = 0
-
-    p_trade_all = []
-    p_dir_all = []
-    y_trade_all = []
-    exit_all = []
-
-    for x, e_last, yt, yd, er_exit, er_fixed, _sidx in loader:
-        x = x.to(DEVICE).float()
+    for x_seq, e_last, y, sample_idx in loader:
+        x_seq = x_seq.to(DEVICE).float()
         e_last = e_last.to(DEVICE).float()
-        yt = yt.to(DEVICE).float()
-        yd = yd.to(DEVICE).float()
-        er_fixed = er_fixed.to(DEVICE).float()
+        y = y.to(DEVICE).float()
 
-        trade_logit, dir_logit, fixed_hat, aux = model(x, e_last, return_aux=True)
-        loss, parts = multitask_loss_twohead_fixedH(trade_logit, dir_logit, fixed_hat, yt, yd, er_fixed, bce_trade, bce_dir, cfg)
-        loss = total_loss_with_adj_reg(loss, aux, cfg)
+        pred = model(x_seq, e_last)
 
-        bsz = int(yt.size(0))
-        tot_loss += float(loss.item()) * bsz
-        tot_tr += float(parts["bce_trade"].item()) * bsz
-        tot_dr += float(parts["bce_dir"].item()) * bsz
-        tot_huber += float(parts["huber"].item()) * bsz
-        tot_util += float(parts["util"].item()) * bsz
-        tot_util_s += float(parts["util_scaled"].item()) * bsz
-        tot_pos_abs += float(parts["pos_abs"].item()) * bsz
-        tot_ptr += float(parts["p_trade_mean"].item()) * bsz
-        n += bsz
+        preds.append(pred.detach().cpu().numpy())
+        targets.append(y.detach().cpu().numpy())
+        sample_positions.append(sample_idx.detach().cpu().numpy())
 
-        p_trade_all.append(torch.sigmoid(trade_logit).detach().cpu().numpy())
-        p_dir_all.append(torch.sigmoid(dir_logit).detach().cpu().numpy())
-        y_trade_all.append(yt.detach().cpu().numpy())
-        exit_all.append(er_exit.detach().cpu().numpy())
-
-    p_trade_np = np.concatenate(p_trade_all, axis=0) if p_trade_all else np.zeros((0,), dtype=np.float64)
-    p_dir_np = np.concatenate(p_dir_all, axis=0) if p_dir_all else np.zeros((0,), dtype=np.float64)
-    y_trade_np = (np.concatenate(y_trade_all, axis=0) > 0.5).astype(np.int64) if y_trade_all else np.zeros((0,), dtype=np.int64)
-    er_exit_np = np.concatenate(exit_all, axis=0) if exit_all else np.zeros((0,), dtype=np.float64)
-
-    t_idx = sample_t[indices.astype(np.int64)]
-    y_tb_np = y_tb[t_idx].astype(np.int64)
-
-    trade_auc, dir_auc = compute_trade_dir_auc_from_twohead(y_trade_np, y_tb_np, p_trade_np, p_dir_np)
-    prob3 = probs3_from_twohead(p_trade_np, p_dir_np)
+    pred_arr = np.concatenate(preds, axis=0).astype(np.float64)
+    y_arr = np.concatenate(targets, axis=0).astype(np.float64)
+    sample_positions = np.concatenate(sample_positions, axis=0).astype(np.int64)
 
     return {
-        "loss": float(tot_loss / max(1, n)),
-        "loss_trade": float(tot_tr / max(1, n)),
-        "loss_dir": float(tot_dr / max(1, n)),
-        "loss_huber": float(tot_huber / max(1, n)),
-        "soft_util_mean": float(tot_util / max(1, n)),
-        "soft_util_scaled_mean": float(tot_util_s / max(1, n)),
-        "pos_abs_mean": float(tot_pos_abs / max(1, n)),
-        "p_trade_mean": float(tot_ptr / max(1, n)),
-        "trade_auc": float(trade_auc) if np.isfinite(trade_auc) else float("nan"),
-        "dir_auc": float(dir_auc) if np.isfinite(dir_auc) else float("nan"),
-        "p_trade": p_trade_np,
-        "p_dir": p_dir_np,
-        "prob3": prob3,
-        "y_tb": y_tb_np,
-        "exit_ret": er_exit_np,
+        "pred": pred_arr,
+        "target": y_arr,
+        "sample_idx": sample_positions,
+    }
+
+
+def compute_benchmark_predictions(indices: np.ndarray) -> Dict[str, np.ndarray]:
+    raw_t = SAMPLE_T[indices.astype(np.int64)]
+    y_true = Y_RET[raw_t].astype(np.float64)
+    eth_lr_now = df[f"lr_{TARGET_ASSET}"].to_numpy(dtype=np.float64)[raw_t]
+
+    pred_zero = np.zeros_like(y_true, dtype=np.float64)
+    pred_last = eth_lr_now * float(HORIZON_BARS)
+
+    return {
+        "y_true": y_true,
+        "pred_zero": pred_zero,
+        "pred_last": pred_last,
     }
 
 # %% [markdown]
-# # Step 10: Artifact saving and loading
+# ## Directional metrics and auxiliary AUCs
 #
-# This cell saves a training bundle as three file types:
-# - model weights in `.pt`,
-# - scaler parameters in `.npz`,
-# - metadata in `.json`.
+# Definitions:
+# - `dir_auc`:
+#   - label = `1` if future ETH return > 0, `0` if future ETH return < 0
+#   - score = raw predicted ETH return
 #
-# The format is intentionally lightweight and avoids pickle-based artifact
-# storage for scalers and metadata.
+# - `trade_auc`:
+#   - label = `1` if `abs(future ETH return)` exceeds the cost-aware threshold
+#   - score = `abs(predicted ETH return)`
+#
+# Signal-level precision metrics are computed after applying the chosen validation threshold.
 
 # %%
-def _to_jsonable_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    out = {}
-    for k, v in cfg.items():
-        out[k] = str(v) if isinstance(v, Path) else v
+def classification_metrics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    signal_threshold: float,
+    trade_label_abs_threshold: float,
+) -> Dict[str, float]:
+    y_true = np.asarray(y_true, dtype=np.float64)
+    y_pred = np.asarray(y_pred, dtype=np.float64)
+
+    dir_label = np.full(len(y_true), np.nan, dtype=np.float64)
+    dir_label[y_true > 0.0] = 1.0
+    dir_label[y_true < 0.0] = 0.0
+
+    trade_label = (np.abs(y_true) > float(trade_label_abs_threshold)).astype(np.float64)
+
+    dir_auc = safe_roc_auc(dir_label, y_pred)
+    trade_auc = safe_roc_auc(trade_label, np.abs(y_pred))
+
+    long_mask = y_pred >= float(signal_threshold)
+    short_mask = y_pred <= -float(signal_threshold)
+    active_mask = long_mask | short_mask
+
+    true_sign = np.zeros(len(y_true), dtype=np.int8)
+    true_sign[y_true > 0.0] = 1
+    true_sign[y_true < 0.0] = -1
+
+    pred_sign = np.zeros(len(y_true), dtype=np.int8)
+    pred_sign[long_mask] = 1
+    pred_sign[short_mask] = -1
+
+    sign_acc = float((pred_sign[active_mask] == true_sign[active_mask]).mean()) if active_mask.any() else float("nan")
+    long_precision = float((true_sign[long_mask] == 1).mean()) if long_mask.any() else float("nan")
+    short_precision = float((true_sign[short_mask] == -1).mean()) if short_mask.any() else float("nan")
+    coverage = float(active_mask.mean()) if len(active_mask) else float("nan")
+
+    return {
+        "dir_auc": dir_auc,
+        "trade_auc": trade_auc,
+        "sign_accuracy": sign_acc,
+        "long_precision": long_precision,
+        "short_precision": short_precision,
+        "coverage": coverage,
+    }
+
+# %% [markdown]
+# ## Sequential non-overlapping backtest
+#
+# This is the critical correction versus the old notebook.
+#
+# Backtest logic:
+# - scan timestamps in order
+# - when flat:
+#   - open long if prediction >= threshold
+#   - open short if prediction <= -threshold
+# - hold for exactly `horizon_bars`
+# - close
+# - advance directly to the first timestamp after the closed trade
+#
+# Because each trade holds the fixed horizon and the index jumps by that horizon,
+# **positions cannot overlap**.
+#
+# Transaction costs:
+# - `cost_bps_per_side` is interpreted as **one-way** cost
+# - net PnL subtracts a **round-trip cost** = `2 * cost_bps_per_side * 1e-4`
+
+# %%
+def sequential_fixed_horizon_backtest(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    signal_threshold: float,
+    horizon_bars: int,
+    cost_bps_per_side: float,
+) -> Tuple[Dict[str, float], pd.DataFrame]:
+    y_true = np.asarray(y_true, dtype=np.float64)
+    y_pred = np.asarray(y_pred, dtype=np.float64)
+
+    n = len(y_true)
+    if n == 0:
+        empty = pd.DataFrame(columns=["entry_idx", "side", "pred", "future_return", "gross_pnl", "net_pnl"])
+        return {
+            "gross_pnl": float("nan"),
+            "net_pnl": float("nan"),
+            "pnl_per_trade": float("nan"),
+            "n_trades": 0,
+            "trade_rate": float("nan"),
+            "sharpe_like": float("nan"),
+        }, empty
+
+    round_trip_cost = round_trip_cost_as_log_return(cost_bps_per_side)
+    i = 0
+    records: List[Dict[str, Any]] = []
+
+    while i < n:
+        score = float(y_pred[i])
+
+        if score >= float(signal_threshold):
+            side = 1
+        elif score <= -float(signal_threshold):
+            side = -1
+        else:
+            i += 1
+            continue
+
+        realized_return = float(y_true[i])
+        gross_pnl = float(side * realized_return)
+        net_pnl = float(gross_pnl - round_trip_cost)
+
+        records.append(
+            {
+                "entry_idx": i,
+                "side": side,
+                "pred": score,
+                "future_return": realized_return,
+                "gross_pnl": gross_pnl,
+                "net_pnl": net_pnl,
+            }
+        )
+
+        i += int(horizon_bars)
+
+    trades_df = pd.DataFrame(records)
+    n_trades = int(len(trades_df))
+    gross_pnl = float(trades_df["gross_pnl"].sum()) if n_trades else 0.0
+    net_pnl = float(trades_df["net_pnl"].sum()) if n_trades else 0.0
+    pnl_per_trade = float(net_pnl / n_trades) if n_trades else float("nan")
+
+    if n_trades >= 2 and trades_df["net_pnl"].std(ddof=1) > 1e-12:
+        sharpe_like = float(
+            trades_df["net_pnl"].mean() / trades_df["net_pnl"].std(ddof=1) * np.sqrt(n_trades)
+        )
+    else:
+        sharpe_like = float("nan")
+
+    metrics = {
+        "gross_pnl": gross_pnl,
+        "net_pnl": net_pnl,
+        "pnl_per_trade": pnl_per_trade,
+        "n_trades": n_trades,
+        "trade_rate": float(n_trades / n),
+        "sharpe_like": sharpe_like,
+    }
+    return metrics, trades_df
+
+# %% [markdown]
+# ## Validation-only threshold selection
+#
+# The signal threshold is selected using only the validation set and the same
+# non-overlapping sequential backtest used later on test/holdout.
+
+# %%
+def build_threshold_grid(y_pred: np.ndarray, cfg: Dict[str, Any]) -> List[float]:
+    abs_pred = np.abs(np.asarray(y_pred, dtype=np.float64))
+    abs_pred = abs_pred[np.isfinite(abs_pred)]
+
+    thresholds = set(float(x) for x in cfg["threshold_grid_abs_return"])
+    if len(abs_pred):
+        for q in cfg["threshold_grid_quantiles"]:
+            thresholds.add(float(np.quantile(abs_pred, float(q))))
+
+    cleaned = sorted(x for x in thresholds if x >= 0.0)
+    out: List[float] = []
+    for x in cleaned:
+        if not out or abs(x - out[-1]) > 1e-12:
+            out.append(float(x))
     return out
+
+
+def sweep_validation_thresholds(
+    y_true_val: np.ndarray,
+    y_pred_val: np.ndarray,
+    cfg: Dict[str, Any],
+) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    thresholds = build_threshold_grid(y_pred_val, cfg)
+
+    for thr in thresholds:
+        bt_metrics, _ = sequential_fixed_horizon_backtest(
+            y_true=y_true_val,
+            y_pred=y_pred_val,
+            signal_threshold=float(thr),
+            horizon_bars=HORIZON_BARS,
+            cost_bps_per_side=float(cfg["cost_bps_per_side"]),
+        )
+        rows.append({"signal_threshold": float(thr), **bt_metrics})
+
+    sweep_df = pd.DataFrame(rows)
+    if len(sweep_df) == 0:
+        raise RuntimeError("Threshold sweep produced no rows.")
+
+    min_trades = int(cfg["min_validation_trades"])
+    feasible = sweep_df[sweep_df["n_trades"] >= min_trades].copy()
+    if len(feasible) == 0:
+        feasible = sweep_df.copy()
+
+    feasible = feasible.sort_values(
+        by=["net_pnl", "pnl_per_trade", "signal_threshold"],
+        ascending=[False, False, True],
+    ).reset_index(drop=True)
+    return feasible
+
+# %% [markdown]
+# ## End-to-end metric package for a split
+
+# %%
+def evaluate_predictions(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    signal_threshold: float,
+    cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    regression = {
+        "rmse": rmse_np(y_true, y_pred),
+        "mae": mae_np(y_true, y_pred),
+        "ic": ic_np(y_true, y_pred),
+    }
+
+    classification = classification_metrics(
+        y_true=y_true,
+        y_pred=y_pred,
+        signal_threshold=float(signal_threshold),
+        trade_label_abs_threshold=TRADE_LABEL_ABS_RETURN_THRESHOLD,
+    )
+
+    backtest_metrics, trades_df = sequential_fixed_horizon_backtest(
+        y_true=y_true,
+        y_pred=y_pred,
+        signal_threshold=float(signal_threshold),
+        horizon_bars=HORIZON_BARS,
+        cost_bps_per_side=float(cfg["cost_bps_per_side"]),
+    )
+
+    return {
+        **regression,
+        **classification,
+        **backtest_metrics,
+        "trades_df": trades_df,
+    }
+
+# %% [markdown]
+# ## Training loop
+
+# %%
+@dataclass
+class SplitArtifacts:
+    model_state: Dict[str, torch.Tensor]
+    node_scaler_params: Dict[str, Any]
+    edge_scaler_params: Dict[str, Any]
+    best_epoch: int
+    best_val_rmse: float
+    signal_threshold: float
+    val_metrics: Dict[str, Any]
+    test_metrics: Dict[str, Any]
+    val_predictions: Dict[str, np.ndarray]
+    test_predictions: Dict[str, np.ndarray]
+
+
+def train_one_split(
+    split_name: str,
+    idx_train: np.ndarray,
+    idx_val: np.ndarray,
+    idx_test: np.ndarray,
+    cfg: Dict[str, Any],
+) -> SplitArtifacts:
+    # Train-only scaling
+    x_node_scaled, node_scaler_params = fit_robust_scaler_train_only(
+        raw_array=X_NODE_RAW,
+        sample_t=SAMPLE_T,
+        train_sample_indices=idx_train,
+        max_abs_value=float(cfg["max_abs_node_feature"]),
+        q_low=float(cfg["scaler_quantile_low"]),
+        q_high=float(cfg["scaler_quantile_high"]),
+    )
+    x_edge_scaled, edge_scaler_params = fit_robust_scaler_train_only(
+        raw_array=EDGE_FEATURE_RAW,
+        sample_t=SAMPLE_T,
+        train_sample_indices=idx_train,
+        max_abs_value=float(cfg["max_abs_edge_feature"]),
+        q_low=float(cfg["scaler_quantile_low"]),
+        q_high=float(cfg["scaler_quantile_high"]),
+    )
+
+    train_ds = TemporalGraphDataset(
+        x_node=x_node_scaled,
+        x_edge=x_edge_scaled,
+        y_ret=Y_RET,
+        sample_t=SAMPLE_T,
+        sample_indices=idx_train,
+        lookback_bars=LOOKBACK_BARS,
+    )
+    val_ds = TemporalGraphDataset(
+        x_node=x_node_scaled,
+        x_edge=x_edge_scaled,
+        y_ret=Y_RET,
+        sample_t=SAMPLE_T,
+        sample_indices=idx_val,
+        lookback_bars=LOOKBACK_BARS,
+    )
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=int(cfg["batch_size"]),
+        shuffle=True,
+        num_workers=0,
+        collate_fn=temporal_graph_collate,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=int(cfg["batch_size"]),
+        shuffle=False,
+        num_workers=0,
+        collate_fn=temporal_graph_collate,
+    )
+
+    model = TemporalGraphBaseline(
+        node_dim=X_NODE_RAW.shape[-1],
+        edge_dim=EDGE_FEATURE_RAW.shape[-1],
+        n_nodes=len(ASSETS),
+        target_node=TARGET_NODE,
+        lookback_bars=LOOKBACK_BARS,
+        cfg=cfg,
+    ).to(DEVICE)
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=float(cfg["lr"]),
+        weight_decay=float(cfg["weight_decay"]),
+    )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=0.5,
+        patience=2,
+    )
+
+    best_state = None
+    best_epoch = -1
+    best_val_rmse = float("inf")
+    bad_epochs = 0
+
+    for epoch in range(1, int(cfg["epochs"]) + 1):
+        model.train()
+        train_losses: List[float] = []
+
+        for x_seq, e_last, y, _sample_idx in train_loader:
+            x_seq = x_seq.to(DEVICE).float()
+            e_last = e_last.to(DEVICE).float()
+            y = y.to(DEVICE).float()
+
+            optimizer.zero_grad(set_to_none=True)
+            pred = model(x_seq, e_last)
+            loss = regression_loss(pred, y, cfg)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), float(cfg["grad_clip"]))
+            optimizer.step()
+
+            train_losses.append(float(loss.detach().cpu().item()))
+
+        model.eval()
+        val_preds, val_targets = [], []
+        with torch.no_grad():
+            for x_seq, e_last, y, _sample_idx in val_loader:
+                x_seq = x_seq.to(DEVICE).float()
+                e_last = e_last.to(DEVICE).float()
+                y = y.to(DEVICE).float()
+
+                pred = model(x_seq, e_last)
+                val_preds.append(pred.detach().cpu().numpy())
+                val_targets.append(y.detach().cpu().numpy())
+
+        val_pred_arr = np.concatenate(val_preds, axis=0).astype(np.float64)
+        val_target_arr = np.concatenate(val_targets, axis=0).astype(np.float64)
+
+        train_loss_mean = float(np.mean(train_losses)) if train_losses else float("nan")
+        val_rmse = rmse_np(val_target_arr, val_pred_arr)
+        val_mae = mae_np(val_target_arr, val_pred_arr)
+        val_ic = ic_np(val_target_arr, val_pred_arr)
+
+        scheduler.step(val_rmse)
+
+        support_mix = torch.softmax(model.support_logits.detach().cpu(), dim=0).numpy().round(3).tolist()
+        lr_now = optimizer.param_groups[0]["lr"]
+
+        print(
+            f"[{split_name}] epoch={epoch:02d} "
+            f"train_loss={train_loss_mean:.6f} "
+            f"val_rmse={val_rmse:.6f} "
+            f"val_mae={val_mae:.6f} "
+            f"val_ic={val_ic:.4f} "
+            f"lr={lr_now:.2e} "
+            f"support_mix={support_mix}"
+        )
+
+        if val_rmse < best_val_rmse:
+            best_val_rmse = float(val_rmse)
+            best_epoch = int(epoch)
+            best_state = copy.deepcopy(model.state_dict())
+            bad_epochs = 0
+        else:
+            bad_epochs += 1
+
+        if bad_epochs >= int(cfg["patience"]):
+            print(f"[{split_name}] early stopping at epoch {epoch}")
+            break
+
+    if best_state is None:
+        raise RuntimeError(f"[{split_name}] best_state is None")
+
+    model.load_state_dict(best_state)
+
+    val_pred_pack = predict_on_indices(
+        model=model,
+        x_node_scaled=x_node_scaled,
+        x_edge_scaled=x_edge_scaled,
+        indices=idx_val,
+        batch_size=int(cfg["batch_size"]),
+    )
+    test_pred_pack = predict_on_indices(
+        model=model,
+        x_node_scaled=x_node_scaled,
+        x_edge_scaled=x_edge_scaled,
+        indices=idx_test,
+        batch_size=int(cfg["batch_size"]),
+    )
+
+    threshold_sweep_df = sweep_validation_thresholds(
+        y_true_val=val_pred_pack["target"],
+        y_pred_val=val_pred_pack["pred"],
+        cfg=cfg,
+    )
+    selected_threshold = float(threshold_sweep_df.iloc[0]["signal_threshold"])
+
+    val_metrics = evaluate_predictions(
+        y_true=val_pred_pack["target"],
+        y_pred=val_pred_pack["pred"],
+        signal_threshold=selected_threshold,
+        cfg=cfg,
+    )
+    test_metrics = evaluate_predictions(
+        y_true=test_pred_pack["target"],
+        y_pred=test_pred_pack["pred"],
+        signal_threshold=selected_threshold,
+        cfg=cfg,
+    )
+
+    print(
+        f"[{split_name}] best_epoch={best_epoch} "
+        f"best_val_rmse={best_val_rmse:.6f} "
+        f"selected_threshold={selected_threshold:.6f}"
+    )
+    print(
+        f"[{split_name}] TEST "
+        f"rmse={test_metrics['rmse']:.6f} "
+        f"mae={test_metrics['mae']:.6f} "
+        f"ic={test_metrics['ic']:.4f} "
+        f"dir_auc={test_metrics['dir_auc']:.4f} "
+        f"trade_auc={test_metrics['trade_auc']:.4f} "
+        f"net_pnl={test_metrics['net_pnl']:.6f} "
+        f"n_trades={test_metrics['n_trades']}"
+    )
+
+    return SplitArtifacts(
+        model_state=copy.deepcopy(model.state_dict()),
+        node_scaler_params=node_scaler_params,
+        edge_scaler_params=edge_scaler_params,
+        best_epoch=best_epoch,
+        best_val_rmse=best_val_rmse,
+        signal_threshold=selected_threshold,
+        val_metrics=val_metrics,
+        test_metrics=test_metrics,
+        val_predictions=val_pred_pack,
+        test_predictions=test_pred_pack,
+    )
+
+# %% [markdown]
+# ## Artifact saving and loading
+
+# %%
+def _jsonable(obj: Any) -> Any:
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (np.float32, np.float64)):
+        return float(obj)
+    if isinstance(obj, (np.int32, np.int64)):
+        return int(obj)
+    if isinstance(obj, dict):
+        return {str(k): _jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_jsonable(v) for v in obj]
+    return obj
 
 
 def save_scaler_npz(path: Path, params: Dict[str, Any]) -> None:
@@ -1601,7 +1616,7 @@ def save_scaler_npz(path: Path, params: Dict[str, Any]) -> None:
         str(path),
         center_=np.asarray(params["center_"], dtype=np.float32),
         scale_=np.asarray(params["scale_"], dtype=np.float32),
-        max_abs=np.asarray([float(params["max_abs"])], dtype=np.float32),
+        max_abs_value=np.asarray([float(params["max_abs_value"])], dtype=np.float32),
     )
 
 
@@ -1610,681 +1625,491 @@ def load_scaler_npz(path: Path) -> Dict[str, Any]:
     return {
         "center_": data["center_"].astype(np.float32),
         "scale_": data["scale_"].astype(np.float32),
-        "max_abs": float(data["max_abs"][0]),
+        "max_abs_value": float(data["max_abs_value"][0]),
     }
 
 
 def save_bundle(
     bundle_dir: Path,
-    name: str,
+    bundle_name: str,
     model_state: Dict[str, torch.Tensor],
-    cfg: Dict[str, Any],
     node_scaler_params: Dict[str, Any],
-    edge_scaler_params: Optional[Dict[str, Any]],
-    extra_meta: Dict[str, Any],
+    edge_scaler_params: Dict[str, Any],
+    meta: Dict[str, Any],
 ) -> Dict[str, Path]:
     bundle_dir.mkdir(parents=True, exist_ok=True)
-    weights_path = bundle_dir / f"{name}_weights.pt"
-    node_scaler_path = bundle_dir / f"{name}_node_scaler.npz"
-    edge_scaler_path = bundle_dir / f"{name}_edge_scaler.npz"
-    meta_path = bundle_dir / f"{name}_meta.json"
+
+    weights_path = bundle_dir / f"{bundle_name}_weights.pt"
+    node_scaler_path = bundle_dir / f"{bundle_name}_node_scaler.npz"
+    edge_scaler_path = bundle_dir / f"{bundle_name}_edge_scaler.npz"
+    meta_path = bundle_dir / f"{bundle_name}_meta.json"
 
     torch.save(model_state, str(weights_path))
     save_scaler_npz(node_scaler_path, node_scaler_params)
+    save_scaler_npz(edge_scaler_path, edge_scaler_params)
 
-    edge_scaler_file = None
-    if edge_scaler_params is not None:
-        save_scaler_npz(edge_scaler_path, edge_scaler_params)
-        edge_scaler_file = edge_scaler_path.name
-
-    meta = {
-        "name": name,
+    meta_payload = {
+        "bundle_name": bundle_name,
         "weights_file": weights_path.name,
         "node_scaler_file": node_scaler_path.name,
-        "edge_scaler_file": edge_scaler_file,
-        "cfg": _to_jsonable_cfg(cfg),
-        **extra_meta,
+        "edge_scaler_file": edge_scaler_path.name,
+        "cfg": _jsonable(CFG),
+        "freq": FREQ,
+        "horizon_minutes": HORIZON_MINUTES,
+        "horizon_bars": HORIZON_BARS,
+        "lookback_bars": LOOKBACK_BARS,
+        "assets": ASSETS,
+        "target_asset": TARGET_ASSET,
+        **_jsonable(meta),
     }
+
     with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2)
+        json.dump(meta_payload, f, indent=2)
 
     return {
         "weights": weights_path,
         "node_scaler": node_scaler_path,
-        "edge_scaler": edge_scaler_path if edge_scaler_params is not None else None,
+        "edge_scaler": edge_scaler_path,
         "meta": meta_path,
     }
 
 
-def load_bundle(bundle_dir: Path, name: str) -> Dict[str, Any]:
-    meta_path = bundle_dir / f"{name}_meta.json"
+def load_bundle(bundle_dir: Path, bundle_name: str) -> Dict[str, Any]:
+    meta_path = bundle_dir / f"{bundle_name}_meta.json"
     if not meta_path.exists():
-        raise FileNotFoundError(str(meta_path))
+        raise FileNotFoundError(meta_path)
 
     with open(meta_path, "r", encoding="utf-8") as f:
         meta = json.load(f)
 
     weights_path = bundle_dir / meta["weights_file"]
     node_scaler_path = bundle_dir / meta["node_scaler_file"]
-    edge_scaler_file = meta.get("edge_scaler_file", None)
-    edge_scaler_path = (bundle_dir / edge_scaler_file) if edge_scaler_file else None
-
-    state = torch.load(str(weights_path), map_location="cpu")
-    node_scaler_params = load_scaler_npz(node_scaler_path)
-    edge_scaler_params = load_scaler_npz(edge_scaler_path) if edge_scaler_path else None
+    edge_scaler_path = bundle_dir / meta["edge_scaler_file"]
 
     return {
         "meta": meta,
-        "state": state,
-        "node_scaler_params": node_scaler_params,
-        "edge_scaler_params": edge_scaler_params,
+        "state_dict": torch.load(str(weights_path), map_location="cpu"),
+        "node_scaler_params": load_scaler_npz(node_scaler_path),
+        "edge_scaler_params": load_scaler_npz(edge_scaler_path),
     }
 
 # %% [markdown]
-# # Step 11: Train one walk-forward fold
-#
-# This cell trains a single fold end-to-end.
-# The temporal encoder is attention-based, but the surrounding training logic is
-# unchanged at a high level: fit on the training window, score on validation,
-# select the best epoch using a utility-aware selection score, and then evaluate
-# validation-selected thresholds on the fold test window.
-
-# %%
-def train_one_fold_twohead_fixedH(
-    fold_id: int,
-    x_scaled: np.ndarray,
-    edge_scaled: np.ndarray,
-    idx_train: np.ndarray,
-    idx_val: np.ndarray,
-    idx_test: np.ndarray,
-    node_scaler_params: Dict[str, Any],
-    edge_scaler_params: Optional[Dict[str, Any]],
-    cfg: Dict[str, Any],
-) -> Dict[str, Any]:
-    t_train = sample_t[idx_train]
-    ytr_train = y_trade[t_train].astype(np.int64)
-    ytb_train = y_tb[t_train].astype(np.int64)
-
-    tr_ds = LobGraphSequenceDatasetTwoHeadFixedH(x_scaled, edge_scaled, y_trade, y_dir, exit_ret, fixed_ret, sample_t, idx_train, int(cfg["lookback"]))
-    va_ds = LobGraphSequenceDatasetTwoHeadFixedH(x_scaled, edge_scaled, y_trade, y_dir, exit_ret, fixed_ret, sample_t, idx_val, int(cfg["lookback"]))
-
-    sampler = None
-    shuffle = True
-    if bool(cfg.get("use_weighted_sampler", True)):
-        sampler = make_weighted_sampler_trade(ytr_train)
-        shuffle = False
-
-    tr_loader = DataLoader(tr_ds, batch_size=int(cfg["batch_size"]), shuffle=shuffle, sampler=sampler, collate_fn=collate_fn_twohead, num_workers=0)
-    va_loader = DataLoader(va_ds, batch_size=int(cfg["batch_size"]), shuffle=False, collate_fn=collate_fn_twohead, num_workers=0)
-
-    model = AttentionGraphTwoHeadFixedH(
-        node_in=int(x_scaled.shape[-1]),
-        edge_dim=int(edge_scaled.shape[-1]),
-        cfg=cfg,
-        n_nodes=len(ASSETS),
-        target_node=TARGET_NODE,
-    ).to(DEVICE)
-
-    pos_w_trade = compute_pos_weights_binary(ytr_train)
-    bce_trade = nn.BCEWithLogitsLoss(pos_weight=pos_w_trade)
-
-    mask_tr = (ytb_train != 1)
-    ydir_train = (ytb_train[mask_tr] == 2).astype(np.int64)
-    pos_w_dir = compute_pos_weights_binary(ydir_train) if ydir_train.size else torch.tensor([1.0], device=DEVICE)
-    bce_dir = nn.BCEWithLogitsLoss(pos_weight=pos_w_dir)
-
-    opt = torch.optim.AdamW(model.parameters(), lr=float(cfg["lr"]), weight_decay=float(cfg["weight_decay"]))
-
-    use_onecycle = bool(cfg.get("use_onecycle", True))
-    if use_onecycle:
-        sch = torch.optim.lr_scheduler.OneCycleLR(
-            opt,
-            max_lr=float(cfg["lr"]),
-            epochs=int(cfg["epochs"]),
-            steps_per_epoch=max(1, len(tr_loader)),
-            pct_start=float(cfg.get("onecycle_pct_start", 0.20)),
-            div_factor=float(cfg.get("onecycle_div_factor", 25.0)),
-            final_div_factor=float(cfg.get("onecycle_final_div", 200.0)),
-        )
-    else:
-        sch = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="max", factor=0.5, patience=3)
-
-    b_dir = float(cfg.get("sel_b_dir_auc", 0.10))
-    trade_pen = float(cfg.get("trade_prob_penalty", 0.0))
-
-    best_sel = -1e18
-    best_state = None
-    best_epoch = -1
-    patience = 7
-    bad = 0
-
-    for ep in range(1, int(cfg["epochs"]) + 1):
-        model.train()
-
-        tot = 0.0
-        tot_tr = 0.0
-        tot_dr = 0.0
-        tot_h = 0.0
-        tot_u = 0.0
-        tot_us = 0.0
-        n_ = 0
-
-        for x, e_last, yt, yd, _er_exit, er_fixed, _sidx in tr_loader:
-            x = x.to(DEVICE).float()
-            e_last = e_last.to(DEVICE).float()
-            yt = yt.to(DEVICE).float()
-            yd = yd.to(DEVICE).float()
-            er_fixed = er_fixed.to(DEVICE).float()
-
-            opt.zero_grad(set_to_none=True)
-            trade_logit, dir_logit, fixed_hat, aux = model(x, e_last, return_aux=True)
-            loss_mt, parts = multitask_loss_twohead_fixedH(
-                trade_logit,
-                dir_logit,
-                fixed_hat,
-                yt,
-                yd,
-                er_fixed,
-                bce_trade,
-                bce_dir,
-                cfg,
-            )
-
-            if trade_pen > 0:
-                loss_mt = loss_mt + trade_pen * parts["p_trade_mean"]
-
-            loss = total_loss_with_adj_reg(loss_mt, aux, cfg)
-            if not torch.isfinite(loss):
-                continue
-
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), float(cfg["grad_clip"]))
-            opt.step()
-            if use_onecycle:
-                sch.step()
-
-            bsz = int(yt.size(0))
-            tot += float(loss.item()) * bsz
-            tot_tr += float(parts["bce_trade"].item()) * bsz
-            tot_dr += float(parts["bce_dir"].item()) * bsz
-            tot_h += float(parts["huber"].item()) * bsz
-            tot_u += float(parts["util"].item()) * bsz
-            tot_us += float(parts["util_scaled"].item()) * bsz
-            n_ += bsz
-
-        tr_loss = tot / max(1, n_)
-        tr_tr = tot_tr / max(1, n_)
-        tr_dr = tot_dr / max(1, n_)
-        tr_h = tot_h / max(1, n_)
-        tr_u = tot_u / max(1, n_)
-        tr_us = tot_us / max(1, n_)
-
-        model.eval()
-        v_tot = 0.0
-        v_tr = 0.0
-        v_dr = 0.0
-        v_h = 0.0
-        v_u = 0.0
-        v_us = 0.0
-        v_pa = 0.0
-        v_ptr = 0.0
-        v_n = 0
-
-        p_trade_list = []
-        p_dir_list = []
-        y_trade_list = []
-
-        for x, e_last, yt, yd, _er_exit, er_fixed, _sidx in va_loader:
-            x = x.to(DEVICE).float()
-            e_last = e_last.to(DEVICE).float()
-            yt = yt.to(DEVICE).float()
-            yd = yd.to(DEVICE).float()
-            er_fixed = er_fixed.to(DEVICE).float()
-
-            trade_logit, dir_logit, fixed_hat, aux = model(x, e_last, return_aux=True)
-            loss_mt, parts = multitask_loss_twohead_fixedH(
-                trade_logit,
-                dir_logit,
-                fixed_hat,
-                yt,
-                yd,
-                er_fixed,
-                bce_trade,
-                bce_dir,
-                cfg,
-            )
-            loss_val = total_loss_with_adj_reg(loss_mt, aux, cfg)
-
-            bsz = int(yt.size(0))
-            v_tot += float(loss_val.item()) * bsz
-            v_tr += float(parts["bce_trade"].item()) * bsz
-            v_dr += float(parts["bce_dir"].item()) * bsz
-            v_h += float(parts["huber"].item()) * bsz
-            v_u += float(parts["util"].item()) * bsz
-            v_us += float(parts["util_scaled"].item()) * bsz
-            v_pa += float(parts["pos_abs"].item()) * bsz
-            v_ptr += float(parts["p_trade_mean"].item()) * bsz
-            v_n += bsz
-
-            p_trade_list.append(torch.sigmoid(trade_logit).detach().cpu().numpy())
-            p_dir_list.append(torch.sigmoid(dir_logit).detach().cpu().numpy())
-            y_trade_list.append((yt.detach().cpu().numpy() > 0.5).astype(np.int64))
-
-        p_trade_np = np.concatenate(p_trade_list, axis=0) if p_trade_list else np.zeros((0,), dtype=np.float64)
-        p_dir_np = np.concatenate(p_dir_list, axis=0) if p_dir_list else np.zeros((0,), dtype=np.float64)
-        y_trade_np = np.concatenate(y_trade_list, axis=0) if y_trade_list else np.zeros((0,), dtype=np.int64)
-
-        t_val = sample_t[idx_val]
-        y_tb_val = y_tb[t_val].astype(np.int64)
-        trade_auc, dir_auc = compute_trade_dir_auc_from_twohead(y_trade_np, y_tb_val, p_trade_np, p_dir_np)
-
-        val_loss = v_tot / max(1, v_n)
-        val_tr = v_tr / max(1, v_n)
-        val_dr = v_dr / max(1, v_n)
-        val_h = v_h / max(1, v_n)
-        val_u = v_u / max(1, v_n)
-        val_us = v_us / max(1, v_n)
-        val_pa = v_pa / max(1, v_n)
-        val_ptr = v_ptr / max(1, v_n)
-
-        sel = float(val_us) + b_dir * (float(dir_auc) if np.isfinite(dir_auc) else 0.0)
-
-        if sel > best_sel:
-            best_sel = sel
-            best_epoch = ep
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            bad = 0
-        else:
-            bad += 1
-
-        if not use_onecycle:
-            sch.step(sel)
-
-        lr_now = opt.param_groups[0]["lr"]
-        w_support = model.support_mix().detach().cpu().numpy().tolist()
-
-        print(
-            f"[fold {fold_id:02d}] ep {ep:02d} lr={lr_now:.2e} "
-            f"tr_loss={tr_loss:.4f} (bceT={tr_tr:.4f}, bceD={tr_dr:.4f}, huber={tr_h:.4f}, util={tr_u:.5f}, utilS={tr_us:.5f}) "
-            f"val_loss={val_loss:.4f} (bceT={val_tr:.4f}, bceD={val_dr:.4f}, huber={val_h:.4f}, util={val_u:.5f}, utilS={val_us:.5f}, posAbs={val_pa:.3f}, pT={val_ptr:.3f}) "
-            f"val_trade_auc={trade_auc:.3f} val_dir_auc={dir_auc:.3f} sel={sel:.5f} "
-            f"best={best_sel:.5f}@ep{best_epoch:02d} supports={np.round(w_support, 3).tolist()}"
-        )
-
-        if bad >= patience:
-            break
-
-    if best_state is not None:
-        model.load_state_dict(best_state)
-
-    val_eval = eval_twohead_on_indices(model, x_scaled, edge_scaled, idx_val, bce_trade, bce_dir, cfg)
-    test_eval = eval_twohead_on_indices(model, x_scaled, edge_scaled, idx_test, bce_trade, bce_dir, cfg)
-
-    true_val_trade_rate = split_trade_ratio(idx_val, sample_t, y_trade)
-    sweep_val = sweep_thresholds_3class(
-        prob3=val_eval["prob3"],
-        exit_ret_arr=val_eval["exit_ret"],
-        cfg=cfg,
-        min_trades=int(cfg["eval_min_trades"]),
-        target_trade_rate=float(true_val_trade_rate),
-    )
-    if len(sweep_val) == 0:
-        raise RuntimeError("Threshold sweep returned no valid rows on validation set.")
-
-    best_thr = sweep_val.iloc[0].to_dict()
-    thr_trade = float(best_thr["thr_trade"])
-    thr_dir = float(best_thr["thr_dir"])
-
-    pnl_val = pnl_from_probs_3class(val_eval["prob3"], val_eval["exit_ret"], thr_trade, thr_dir, cfg["cost_bps"])
-    pnl_test = pnl_from_probs_3class(test_eval["prob3"], test_eval["exit_ret"], thr_trade, thr_dir, cfg["cost_bps"])
-
-    print(
-        f"[fold {fold_id:02d}] chosen thresholds on VAL: thr_trade={thr_trade:.3f} thr_dir={thr_dir:.3f} "
-        f"| val pnl_sum={pnl_val['pnl_sum']:.4f} val trade_rate={pnl_val['trade_rate']:.3f}"
-    )
-    print(
-        f"[fold {fold_id:02d}] TEST (fixed thresholds from VAL): "
-        f"trade_auc={test_eval['trade_auc']:.3f} dir_auc={test_eval['dir_auc']:.3f} "
-        f"soft_utilS={test_eval['soft_util_scaled_mean']:.5f} pnl_sum={pnl_test['pnl_sum']:.4f} "
-        f"trade_rate={pnl_test['trade_rate']:.3f} trades={pnl_test['n_trades']}"
-    )
-
-    return {
-        "fold": int(fold_id),
-        "model_state": {k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
-        "node_scaler_params": node_scaler_params,
-        "edge_scaler_params": edge_scaler_params,
-        "idx_train": idx_train,
-        "idx_val": idx_val,
-        "idx_test": idx_test,
-        "best_epoch": int(best_epoch),
-        "best_sel": float(best_sel),
-        "val_eval": val_eval,
-        "test_eval": test_eval,
-        "thr_trade": thr_trade,
-        "thr_dir": thr_dir,
-        "pnl_val": pnl_val,
-        "pnl_test": pnl_test,
-    }
-
-# %% [markdown]
-# # Step 12: Walk-forward CV run and per-fold artifact saving
-#
-# This cell runs the full walk-forward training loop, stores one bundle per
-# fold, and then creates an `overall_best` bundle by copying the strongest fold
-# according to the validation selection score.
-#
-# The overall logic is intentionally preserved from the original notebook so the
-# downstream holdout evaluation and production refit workflow stay unchanged.
-
-# %%
-def run_walk_forward_cv_twohead_fixedH() -> Tuple[pd.DataFrame, List[Dict[str, Any]], str]:
-    fold_artifacts: List[Dict[str, Any]] = []
-    rows: List[Dict[str, Any]] = []
-
-    best_overall_sel = -1e18
-    best_overall_name = None
-
-    for fi, (idx_tr, idx_va, idx_te) in enumerate(walk_splits, 1):
-        print("\n" + "=" * 90)
-        print(f"FOLD {fi}/{len(walk_splits)} sizes: train={len(idx_tr)} val={len(idx_va)} test={len(idx_te)}")
-        print(f"True trade ratio (val):  {split_trade_ratio(idx_va, sample_t, y_trade):.3f}")
-        print(f"True trade ratio (test): {split_trade_ratio(idx_te, sample_t, y_trade):.3f}")
-
-        x_scaled, node_params = fit_scale_nodes_train_only(X_node_raw, sample_t, idx_tr, max_abs=float(CFG["max_abs_feat"]))
-        if bool(CFG.get("edge_scale", True)):
-            edge_scaled, edge_params = fit_scale_edges_train_only(edge_feat, sample_t, idx_tr, max_abs=float(CFG["max_abs_edge"]))
-        else:
-            edge_scaled = edge_feat.astype(np.float32)
-            edge_params = None
-
-        artifact = train_one_fold_twohead_fixedH(
-            fold_id=fi,
-            x_scaled=x_scaled,
-            edge_scaled=edge_scaled,
-            idx_train=idx_tr,
-            idx_val=idx_va,
-            idx_test=idx_te,
-            node_scaler_params=node_params,
-            edge_scaler_params=edge_params,
-            cfg=CFG,
-        )
-
-        fold_name = f"fold_{fi:02d}"
-        extra_meta = {
-            "kind": "fold_best",
-            "fold": fi,
-            "best_epoch": artifact["best_epoch"],
-            "best_sel": artifact["best_sel"],
-            "thr_trade": artifact["thr_trade"],
-            "thr_dir": artifact["thr_dir"],
-            "idx_train": artifact["idx_train"].tolist(),
-            "idx_val": artifact["idx_val"].tolist(),
-            "idx_test": artifact["idx_test"].tolist(),
-        }
-        saved = save_bundle(
-            bundle_dir=ART_DIR,
-            name=fold_name,
-            model_state=artifact["model_state"],
-            cfg=CFG,
-            node_scaler_params=artifact["node_scaler_params"],
-            edge_scaler_params=artifact["edge_scaler_params"],
-            extra_meta=extra_meta,
-        )
-        print("Saved fold bundle:", saved["meta"].name)
-
-        if float(artifact["best_sel"]) > best_overall_sel:
-            best_overall_sel = float(artifact["best_sel"])
-            best_overall_name = fold_name
-
-        fold_artifacts.append(artifact)
-        rows.append({
-            "fold": fi,
-            "val_trade_auc": artifact["val_eval"]["trade_auc"],
-            "val_dir_auc": artifact["val_eval"]["dir_auc"],
-            "val_soft_utilS": artifact["val_eval"]["soft_util_scaled_mean"],
-            "val_loss": artifact["val_eval"]["loss"],
-            "test_trade_auc": artifact["test_eval"]["trade_auc"],
-            "test_dir_auc": artifact["test_eval"]["dir_auc"],
-            "test_soft_utilS": artifact["test_eval"]["soft_util_scaled_mean"],
-            "test_loss": artifact["test_eval"]["loss"],
-            "thr_trade": artifact["thr_trade"],
-            "thr_dir": artifact["thr_dir"],
-            "test_trade_rate_pred": artifact["pnl_test"]["trade_rate"],
-            "test_pnl_sum": artifact["pnl_test"]["pnl_sum"],
-            "test_n_trades": artifact["pnl_test"]["n_trades"],
-            "best_sel": artifact["best_sel"],
-        })
-
-    cv_summary = pd.DataFrame(rows)
-    assert best_overall_name is not None
-    overall_name = "overall_best"
-
-    best_bundle = load_bundle(ART_DIR, best_overall_name)
-    extra_meta = {
-        "kind": "overall_best",
-        "source_name": best_overall_name,
-        "source_fold": best_bundle["meta"].get("fold", None),
-        "thr_trade": best_bundle["meta"]["thr_trade"],
-        "thr_dir": best_bundle["meta"]["thr_dir"],
-        "idx_train": best_bundle["meta"]["idx_train"],
-        "idx_val": best_bundle["meta"]["idx_val"],
-        "idx_test": best_bundle["meta"]["idx_test"],
-    }
-    save_bundle(
-        bundle_dir=ART_DIR,
-        name=overall_name,
-        model_state=best_bundle["state"],
-        cfg=CFG,
-        node_scaler_params=best_bundle["node_scaler_params"],
-        edge_scaler_params=best_bundle["edge_scaler_params"],
-        extra_meta=extra_meta,
-    )
-    print("\nSaved overall best bundle as:", overall_name)
-    return cv_summary, fold_artifacts, overall_name
-
-
-cv_summary_twohead, fold_artifacts_twohead, overall_best_name = run_walk_forward_cv_twohead_fixedH()
-
-print("\n" + "=" * 90)
-print("CV summary (attention temporal encoder; TEST uses thresholds selected on VAL):")
-print(cv_summary_twohead)
-print("\nMeans:")
-print(cv_summary_twohead.mean(numeric_only=True))
-
-# %% [markdown]
-# # Step 12.1: Aggregated threshold check after cross-validation
-#
-# This cell runs a single threshold-pair diagnostic on the concatenated fold test
-# predictions. The results are printed and saved as a CSV artifact.
-
-# %%
-_ = check_threshold_pairs_after_cv_once(
-    fold_artifacts=fold_artifacts_twohead,
-    cfg=CFG,
-    split="test",
-    top_k=20,
-    save_csv_path=(ART_DIR / "threshold_check_after_cv_aggregate_TEST.csv"),
-)
-
-# %% [markdown]
-# # Step 13: Evaluate a saved bundle on the final holdout
-#
-# This cell reloads a saved bundle, reapplies the stored scalers, evaluates the
-# model on any chosen index set, and computes PnL using the saved thresholds.
-# The logic is kept close to the original notebook so model bundles remain easy
-# to reuse after training.
+# ## Saved-bundle evaluation helper
 
 # %%
 @torch.no_grad()
-def evaluate_bundle_on_indices(
+def evaluate_saved_bundle_on_indices(
     bundle_dir: Path,
-    name: str,
+    bundle_name: str,
     indices: np.ndarray,
     label: str,
-    do_threshold_check: bool = False,
-    threshold_check_top_k: int = 20,
-    threshold_check_csv: Optional[Path] = None,
 ) -> Dict[str, Any]:
-    bundle = load_bundle(bundle_dir, name)
-    cfg = bundle["meta"]["cfg"]
+    loaded = load_bundle(bundle_dir, bundle_name)
+    meta = loaded["meta"]
 
-    model = AttentionGraphTwoHeadFixedH(
-        node_in=int(X_node_raw.shape[-1]),
-        edge_dim=int(edge_feat.shape[-1]),
-        cfg=cfg,
+    model = TemporalGraphBaseline(
+        node_dim=X_NODE_RAW.shape[-1],
+        edge_dim=EDGE_FEATURE_RAW.shape[-1],
         n_nodes=len(ASSETS),
         target_node=TARGET_NODE,
+        lookback_bars=int(meta["lookback_bars"]),
+        cfg=meta["cfg"],
     ).to(DEVICE)
-    model.load_state_dict(bundle["state"])
+    model.load_state_dict(loaded["state_dict"])
     model.eval()
 
-    x_scaled = apply_scaler_params(X_node_raw.astype(np.float32), bundle["node_scaler_params"])
-    if bundle["edge_scaler_params"] is not None:
-        e_scaled = apply_scaler_params(edge_feat.astype(np.float32), bundle["edge_scaler_params"])
-    else:
-        e_scaled = edge_feat.astype(np.float32)
+    x_node_scaled = apply_robust_scaler_params(X_NODE_RAW, loaded["node_scaler_params"])
+    x_edge_scaled = apply_robust_scaler_params(EDGE_FEATURE_RAW, loaded["edge_scaler_params"])
 
-    idx_train_saved = np.asarray(bundle["meta"]["idx_train"], dtype=np.int64)
-    t_train = sample_t[idx_train_saved]
-    ytr_train = y_trade[t_train].astype(np.int64)
-    ytb_train = y_tb[t_train].astype(np.int64)
+    pred_pack = predict_on_indices(
+        model=model,
+        x_node_scaled=x_node_scaled,
+        x_edge_scaled=x_edge_scaled,
+        indices=indices.astype(np.int64),
+        batch_size=int(meta["cfg"]["batch_size"]),
+    )
+    threshold = float(meta["selected_signal_threshold"])
+    metrics = evaluate_predictions(
+        y_true=pred_pack["target"],
+        y_pred=pred_pack["pred"],
+        signal_threshold=threshold,
+        cfg=meta["cfg"],
+    )
 
-    pos_w_trade = compute_pos_weights_binary(ytr_train)
-    bce_trade = nn.BCEWithLogitsLoss(pos_weight=pos_w_trade)
+    bm = compute_benchmark_predictions(indices.astype(np.int64))
+    bench = {
+        "zero_rmse": rmse_np(bm["y_true"], bm["pred_zero"]),
+        "zero_mae": mae_np(bm["y_true"], bm["pred_zero"]),
+        "zero_ic": ic_np(bm["y_true"], bm["pred_zero"]),
+        "last_rmse": rmse_np(bm["y_true"], bm["pred_last"]),
+        "last_mae": mae_np(bm["y_true"], bm["pred_last"]),
+        "last_ic": ic_np(bm["y_true"], bm["pred_last"]),
+    }
 
-    mask_tr = (ytb_train != 1)
-    ydir_train = (ytb_train[mask_tr] == 2).astype(np.int64)
-    pos_w_dir = compute_pos_weights_binary(ydir_train) if ydir_train.size else torch.tensor([1.0], device=DEVICE)
-    bce_dir = nn.BCEWithLogitsLoss(pos_weight=pos_w_dir)
-
-    ev = eval_twohead_on_indices(model, x_scaled, e_scaled, indices.astype(np.int64), bce_trade, bce_dir, cfg)
-
-    thr_trade = float(bundle["meta"]["thr_trade"])
-    thr_dir = float(bundle["meta"]["thr_dir"])
-    pnl = pnl_from_probs_3class(ev["prob3"], ev["exit_ret"], thr_trade, thr_dir, float(cfg["cost_bps"]))
-
-    print("\n" + "=" * 90)
+    print("\n" + "=" * 100)
     print(label)
-    print(f"bundle: {name}")
-    print(f"trade_auc={ev['trade_auc']:.3f} | dir_auc={ev['dir_auc']:.3f} | loss={ev['loss']:.4f}")
-    print(f"soft_util={ev['soft_util_mean']:.6f} | soft_utilS={ev['soft_util_scaled_mean']:.5f} | pos_abs={ev['pos_abs_mean']:.4f} | p_trade_mean={ev['p_trade_mean']:.3f}")
-    print(f"pnl_sum={pnl['pnl_sum']:.4f} | trade_rate={pnl['trade_rate']:.3f} | trades={pnl['n_trades']}")
+    print(f"bundle_name={bundle_name}")
+    print(
+        f"rmse={metrics['rmse']:.6f} "
+        f"mae={metrics['mae']:.6f} "
+        f"ic={metrics['ic']:.4f} "
+        f"dir_auc={metrics['dir_auc']:.4f} "
+        f"trade_auc={metrics['trade_auc']:.4f}"
+    )
+    print(
+        f"sign_accuracy={metrics['sign_accuracy']:.4f} "
+        f"long_precision={metrics['long_precision']:.4f} "
+        f"short_precision={metrics['short_precision']:.4f} "
+        f"coverage={metrics['coverage']:.4f}"
+    )
+    print(
+        f"gross_pnl={metrics['gross_pnl']:.6f} "
+        f"net_pnl={metrics['net_pnl']:.6f} "
+        f"pnl_per_trade={metrics['pnl_per_trade']:.6f} "
+        f"n_trades={metrics['n_trades']} "
+        f"trade_rate={metrics['trade_rate']:.4f} "
+        f"sharpe_like={metrics['sharpe_like']:.4f}"
+    )
+    print(
+        f"bench_zero_rmse={bench['zero_rmse']:.6f} "
+        f"bench_last_rmse={bench['last_rmse']:.6f}"
+    )
 
-    if do_threshold_check:
-        _ = check_threshold_pairs_once(
-            prob3=ev["prob3"],
-            exit_ret_arr=ev["exit_ret"],
-            cfg=cfg,
-            label=f"THRESHOLD CHECK (bundle={name}) on: {label}",
-            min_trades=int(cfg.get("eval_min_trades", 1)),
-            target_trade_rate=None,
-            top_k=threshold_check_top_k,
-            save_csv_path=threshold_check_csv,
-        )
-
-    return {"eval": ev, "pnl": pnl}
-
-
-holdout_indices = idx_final_test.astype(np.int64)
-_ = evaluate_bundle_on_indices(
-    ART_DIR,
-    overall_best_name,
-    holdout_indices,
-    label="FINAL HOLDOUT (10%) using overall_best",
-    do_threshold_check=False,
-)
+    return {
+        "pred_pack": pred_pack,
+        "metrics": metrics,
+        "benchmarks": bench,
+        "threshold": threshold,
+    }
 
 # %% [markdown]
-# # Step 14: Production fit on the latest cross-validation region and evaluation on the final holdout
+# ## Walk-forward CV pipeline
 #
-# This cell keeps the original production workflow: train on the full CV region,
-# use the last validation slice of that region for threshold selection, and then
-# evaluate the resulting bundle on the reserved final holdout. A single
-# threshold-pair diagnostic is also saved after this production refit.
+# For each fold:
+# - fit scalers on train only
+# - train model on train
+# - early stop on validation RMSE
+# - choose signal threshold on validation only
+# - report validation and test metrics
+#
+# We also save one bundle per fold and track the overall best fold by validation RMSE.
 
 # %%
-def production_fit_and_save() -> str:
-    print("\n" + "=" * 90)
-    print("PRODUCTION FIT: train on CV(90%) -> select thresholds on val_final -> eval on FINAL holdout(10%)")
+cv_rows: List[Dict[str, Any]] = []
+fold_bundle_names: List[str] = []
+best_cv_bundle_name: Optional[str] = None
+best_cv_val_rmse = float("inf")
 
-    val_w = max(1, int(float(CFG["val_window_frac"]) * n_samples_cv))
-    train_end = n_samples_cv - val_w
+for fold_idx, (idx_train, idx_val, idx_test) in enumerate(WALK_FORWARD_SPLITS, start=1):
+    print("\n" + "=" * 100)
+    print(
+        f"FOLD {fold_idx}/{len(WALK_FORWARD_SPLITS)} "
+        f"train={len(idx_train)} val={len(idx_val)} test={len(idx_test)}"
+    )
+
+    artifacts = train_one_split(
+        split_name=f"fold_{fold_idx:02d}",
+        idx_train=idx_train,
+        idx_val=idx_val,
+        idx_test=idx_test,
+        cfg=CFG,
+    )
+
+    bundle_name = f"fold_{fold_idx:02d}_best"
+    fold_bundle_names.append(bundle_name)
+
+    save_bundle(
+        bundle_dir=ARTIFACT_DIR,
+        bundle_name=bundle_name,
+        model_state=artifacts.model_state,
+        node_scaler_params=artifacts.node_scaler_params,
+        edge_scaler_params=artifacts.edge_scaler_params,
+        meta={
+            "kind": "cv_fold_best",
+            "fold_idx": fold_idx,
+            "best_epoch": artifacts.best_epoch,
+            "best_val_rmse": artifacts.best_val_rmse,
+            "selected_signal_threshold": artifacts.signal_threshold,
+            "idx_train": idx_train.tolist(),
+            "idx_val": idx_val.tolist(),
+            "idx_test": idx_test.tolist(),
+        },
+    )
+
+    artifacts.val_metrics["trades_df"].to_csv(
+        ARTIFACT_DIR / f"{bundle_name}_val_trades.csv",
+        index=False,
+    )
+    artifacts.test_metrics["trades_df"].to_csv(
+        ARTIFACT_DIR / f"{bundle_name}_test_trades.csv",
+        index=False,
+    )
+
+    val_bm = compute_benchmark_predictions(idx_val)
+    test_bm = compute_benchmark_predictions(idx_test)
+
+    row = {
+        "fold": fold_idx,
+        "best_epoch": artifacts.best_epoch,
+        "best_val_rmse_checkpoint": artifacts.best_val_rmse,
+        "selected_signal_threshold": artifacts.signal_threshold,
+
+        "val_rmse": artifacts.val_metrics["rmse"],
+        "val_mae": artifacts.val_metrics["mae"],
+        "val_ic": artifacts.val_metrics["ic"],
+        "val_dir_auc": artifacts.val_metrics["dir_auc"],
+        "val_trade_auc": artifacts.val_metrics["trade_auc"],
+        "val_sign_accuracy": artifacts.val_metrics["sign_accuracy"],
+        "val_long_precision": artifacts.val_metrics["long_precision"],
+        "val_short_precision": artifacts.val_metrics["short_precision"],
+        "val_coverage": artifacts.val_metrics["coverage"],
+        "val_gross_pnl": artifacts.val_metrics["gross_pnl"],
+        "val_net_pnl": artifacts.val_metrics["net_pnl"],
+        "val_pnl_per_trade": artifacts.val_metrics["pnl_per_trade"],
+        "val_n_trades": artifacts.val_metrics["n_trades"],
+        "val_trade_rate": artifacts.val_metrics["trade_rate"],
+        "val_sharpe_like": artifacts.val_metrics["sharpe_like"],
+        "val_bench_zero_rmse": rmse_np(val_bm["y_true"], val_bm["pred_zero"]),
+        "val_bench_last_rmse": rmse_np(val_bm["y_true"], val_bm["pred_last"]),
+
+        "test_rmse": artifacts.test_metrics["rmse"],
+        "test_mae": artifacts.test_metrics["mae"],
+        "test_ic": artifacts.test_metrics["ic"],
+        "test_dir_auc": artifacts.test_metrics["dir_auc"],
+        "test_trade_auc": artifacts.test_metrics["trade_auc"],
+        "test_sign_accuracy": artifacts.test_metrics["sign_accuracy"],
+        "test_long_precision": artifacts.test_metrics["long_precision"],
+        "test_short_precision": artifacts.test_metrics["short_precision"],
+        "test_coverage": artifacts.test_metrics["coverage"],
+        "test_gross_pnl": artifacts.test_metrics["gross_pnl"],
+        "test_net_pnl": artifacts.test_metrics["net_pnl"],
+        "test_pnl_per_trade": artifacts.test_metrics["pnl_per_trade"],
+        "test_n_trades": artifacts.test_metrics["n_trades"],
+        "test_trade_rate": artifacts.test_metrics["trade_rate"],
+        "test_sharpe_like": artifacts.test_metrics["sharpe_like"],
+        "test_bench_zero_rmse": rmse_np(test_bm["y_true"], test_bm["pred_zero"]),
+        "test_bench_last_rmse": rmse_np(test_bm["y_true"], test_bm["pred_last"]),
+    }
+    cv_rows.append(row)
+
+    if artifacts.best_val_rmse < best_cv_val_rmse:
+        best_cv_val_rmse = float(artifacts.best_val_rmse)
+        best_cv_bundle_name = bundle_name
+
+if best_cv_bundle_name is None:
+    raise RuntimeError("best_cv_bundle_name is None")
+
+CV_RESULTS_DF = pd.DataFrame(cv_rows)
+CV_RESULTS_DF.to_csv(ARTIFACT_DIR / "cv_results_summary.csv", index=False)
+
+print("\n" + "=" * 100)
+print("CV_RESULTS_DF")
+print(CV_RESULTS_DF)
+print("\nCV mean metrics:")
+print(CV_RESULTS_DF.mean(numeric_only=True))
+print("\nBest CV bundle:", best_cv_bundle_name)
+
+# %% [markdown]
+# ## Post-CV holdout evaluation
+#
+# This uses the **best CV-selected model bundle** exactly as saved from CV.
+# There is **no retuning on the holdout**.
+
+# %%
+POST_CV_HOLDOUT = evaluate_saved_bundle_on_indices(
+    bundle_dir=ARTIFACT_DIR,
+    bundle_name=best_cv_bundle_name,
+    indices=IDX_HOLDOUT,
+    label="POST-CV HOLDOUT EVALUATION USING BEST CV-SELECTED MODEL",
+)
+
+POST_CV_HOLDOUT_SUMMARY_DF = pd.DataFrame(
+    [
+        {
+            "model_name": best_cv_bundle_name,
+            "rmse": POST_CV_HOLDOUT["metrics"]["rmse"],
+            "mae": POST_CV_HOLDOUT["metrics"]["mae"],
+            "ic": POST_CV_HOLDOUT["metrics"]["ic"],
+            "dir_auc": POST_CV_HOLDOUT["metrics"]["dir_auc"],
+            "trade_auc": POST_CV_HOLDOUT["metrics"]["trade_auc"],
+            "sign_accuracy": POST_CV_HOLDOUT["metrics"]["sign_accuracy"],
+            "long_precision": POST_CV_HOLDOUT["metrics"]["long_precision"],
+            "short_precision": POST_CV_HOLDOUT["metrics"]["short_precision"],
+            "coverage": POST_CV_HOLDOUT["metrics"]["coverage"],
+            "gross_pnl": POST_CV_HOLDOUT["metrics"]["gross_pnl"],
+            "net_pnl": POST_CV_HOLDOUT["metrics"]["net_pnl"],
+            "pnl_per_trade": POST_CV_HOLDOUT["metrics"]["pnl_per_trade"],
+            "n_trades": POST_CV_HOLDOUT["metrics"]["n_trades"],
+            "trade_rate": POST_CV_HOLDOUT["metrics"]["trade_rate"],
+            "sharpe_like": POST_CV_HOLDOUT["metrics"]["sharpe_like"],
+            "bench_zero_rmse": POST_CV_HOLDOUT["benchmarks"]["zero_rmse"],
+            "bench_last_rmse": POST_CV_HOLDOUT["benchmarks"]["last_rmse"],
+            "selected_signal_threshold": POST_CV_HOLDOUT["threshold"],
+        }
+    ]
+)
+POST_CV_HOLDOUT_SUMMARY_DF.to_csv(ARTIFACT_DIR / "post_cv_holdout_summary.csv", index=False)
+
+print("\nPOST_CV_HOLDOUT_SUMMARY_DF")
+print(POST_CV_HOLDOUT_SUMMARY_DF)
+
+# %% [markdown]
+# ## Full-refit / production-style evaluation
+#
+# Final protocol:
+# - use the pre-holdout region only
+# - split it into:
+#   - `train_final`
+#   - purge gap
+#   - `val_final`
+# - then leave another purge gap before the untouched holdout
+#
+# Threshold selection again uses **validation only**.
+# Holdout is evaluated once at the end.
+
+# %%
+def make_final_production_split(
+    idx_preholdout: np.ndarray,
+    idx_holdout: np.ndarray,
+    val_window_frac: float,
+    gap: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    n_pre = len(idx_preholdout)
+    val_n = max(1, int(round(n_pre * float(val_window_frac))))
+
+    train_end = n_pre - gap - val_n
+    if train_end <= 0:
+        raise RuntimeError("Not enough pre-holdout samples for final production split.")
 
     idx_train_final = np.arange(0, train_end, dtype=np.int64)
-    idx_val_final = np.arange(train_end, n_samples_cv, dtype=np.int64)
-    idx_holdout = idx_final_test.astype(np.int64)
+    idx_val_final = np.arange(train_end + gap, train_end + gap + val_n, dtype=np.int64)
 
-    print("Sizes:")
-    print("  train_final:", len(idx_train_final))
-    print("  val_final  :", len(idx_val_final))
-    print("  holdout    :", len(idx_holdout))
-    print(f"True trade ratio (val_final): {split_trade_ratio(idx_val_final, sample_t, y_trade):.3f}")
-    print(f"True trade ratio (holdout):   {split_trade_ratio(idx_holdout, sample_t, y_trade):.3f}")
+    if idx_val_final[-1] >= n_pre:
+        raise RuntimeError("Final validation split exceeds pre-holdout region.")
 
-    x_scaled, node_params = fit_scale_nodes_train_only(X_node_raw, sample_t, idx_train_final, max_abs=float(CFG["max_abs_feat"]))
-    if bool(CFG.get("edge_scale", True)):
-        edge_scaled, edge_params = fit_scale_edges_train_only(edge_feat, sample_t, idx_train_final, max_abs=float(CFG["max_abs_edge"]))
-    else:
-        edge_scaled = edge_feat.astype(np.float32)
-        edge_params = None
-
-    artifact = train_one_fold_twohead_fixedH(
-        fold_id=99,
-        x_scaled=x_scaled,
-        edge_scaled=edge_scaled,
-        idx_train=idx_train_final,
-        idx_val=idx_val_final,
-        idx_test=idx_holdout,
-        node_scaler_params=node_params,
-        edge_scaler_params=edge_params,
-        cfg=CFG,
-    )
-
-    production_name = "production_best"
-    extra_meta = {
-        "kind": "production_best",
-        "fold": 99,
-        "best_epoch": artifact["best_epoch"],
-        "best_sel": artifact["best_sel"],
-        "thr_trade": artifact["thr_trade"],
-        "thr_dir": artifact["thr_dir"],
-        "idx_train": artifact["idx_train"].tolist(),
-        "idx_val": artifact["idx_val"].tolist(),
-        "idx_test": artifact["idx_test"].tolist(),
-    }
-    save_bundle(
-        bundle_dir=ART_DIR,
-        name=production_name,
-        model_state=artifact["model_state"],
-        cfg=CFG,
-        node_scaler_params=artifact["node_scaler_params"],
-        edge_scaler_params=artifact["edge_scaler_params"],
-        extra_meta=extra_meta,
-    )
-
-    print("\nSaved production bundle as:", production_name)
-
-    _ = check_threshold_pairs_once(
-        prob3=artifact["test_eval"]["prob3"],
-        exit_ret_arr=artifact["test_eval"]["exit_ret"],
-        cfg=CFG,
-        label="THRESHOLD CHECK (AFTER PRODUCTION REFIT) | HOLDOUT",
-        min_trades=int(CFG.get("eval_min_trades", 1)),
-        target_trade_rate=None,
-        top_k=20,
-        save_csv_path=(ART_DIR / "threshold_check_after_production_holdout.csv"),
-    )
-
-    return production_name
+    return idx_train_final, idx_val_final, idx_holdout.astype(np.int64)
 
 
-production_best_name = production_fit_and_save()
-
-_ = evaluate_bundle_on_indices(
-    ART_DIR,
-    production_best_name,
-    idx_final_test.astype(np.int64),
-    label="TEST-ONLY FROM PRODUCTION BUNDLE (holdout)",
-    do_threshold_check=False,
+IDX_TRAIN_FINAL, IDX_VAL_FINAL, IDX_TEST_FINAL = make_final_production_split(
+    idx_preholdout=IDX_PREHOLDOUT,
+    idx_holdout=IDX_HOLDOUT,
+    val_window_frac=float(CFG["val_window_frac"]),
+    gap=PURGE_GAP_BARS,
 )
+
+print("Production split sizes:")
+print("train_final:", len(IDX_TRAIN_FINAL))
+print("val_final  :", len(IDX_VAL_FINAL))
+print("holdout    :", len(IDX_TEST_FINAL))
+
+# %%
+PRODUCTION_ARTIFACTS = train_one_split(
+    split_name="production_refit",
+    idx_train=IDX_TRAIN_FINAL,
+    idx_val=IDX_VAL_FINAL,
+    idx_test=IDX_TEST_FINAL,
+    cfg=CFG,
+)
+
+PRODUCTION_BUNDLE_NAME = "production_best"
+
+save_bundle(
+    bundle_dir=ARTIFACT_DIR,
+    bundle_name=PRODUCTION_BUNDLE_NAME,
+    model_state=PRODUCTION_ARTIFACTS.model_state,
+    node_scaler_params=PRODUCTION_ARTIFACTS.node_scaler_params,
+    edge_scaler_params=PRODUCTION_ARTIFACTS.edge_scaler_params,
+    meta={
+        "kind": "production_best",
+        "best_epoch": PRODUCTION_ARTIFACTS.best_epoch,
+        "best_val_rmse": PRODUCTION_ARTIFACTS.best_val_rmse,
+        "selected_signal_threshold": PRODUCTION_ARTIFACTS.signal_threshold,
+        "idx_train": IDX_TRAIN_FINAL.tolist(),
+        "idx_val": IDX_VAL_FINAL.tolist(),
+        "idx_test": IDX_TEST_FINAL.tolist(),
+    },
+)
+
+PRODUCTION_ARTIFACTS.val_metrics["trades_df"].to_csv(
+    ARTIFACT_DIR / f"{PRODUCTION_BUNDLE_NAME}_val_trades.csv",
+    index=False,
+)
+PRODUCTION_ARTIFACTS.test_metrics["trades_df"].to_csv(
+    ARTIFACT_DIR / f"{PRODUCTION_BUNDLE_NAME}_holdout_trades.csv",
+    index=False,
+)
+
+PRODUCTION_HOLDOUT = evaluate_saved_bundle_on_indices(
+    bundle_dir=ARTIFACT_DIR,
+    bundle_name=PRODUCTION_BUNDLE_NAME,
+    indices=IDX_HOLDOUT,
+    label="FULL-REFIT / PRODUCTION HOLDOUT EVALUATION",
+)
+
+PRODUCTION_HOLDOUT_SUMMARY_DF = pd.DataFrame(
+    [
+        {
+            "model_name": PRODUCTION_BUNDLE_NAME,
+            "rmse": PRODUCTION_HOLDOUT["metrics"]["rmse"],
+            "mae": PRODUCTION_HOLDOUT["metrics"]["mae"],
+            "ic": PRODUCTION_HOLDOUT["metrics"]["ic"],
+            "dir_auc": PRODUCTION_HOLDOUT["metrics"]["dir_auc"],
+            "trade_auc": PRODUCTION_HOLDOUT["metrics"]["trade_auc"],
+            "sign_accuracy": PRODUCTION_HOLDOUT["metrics"]["sign_accuracy"],
+            "long_precision": PRODUCTION_HOLDOUT["metrics"]["long_precision"],
+            "short_precision": PRODUCTION_HOLDOUT["metrics"]["short_precision"],
+            "coverage": PRODUCTION_HOLDOUT["metrics"]["coverage"],
+            "gross_pnl": PRODUCTION_HOLDOUT["metrics"]["gross_pnl"],
+            "net_pnl": PRODUCTION_HOLDOUT["metrics"]["net_pnl"],
+            "pnl_per_trade": PRODUCTION_HOLDOUT["metrics"]["pnl_per_trade"],
+            "n_trades": PRODUCTION_HOLDOUT["metrics"]["n_trades"],
+            "trade_rate": PRODUCTION_HOLDOUT["metrics"]["trade_rate"],
+            "sharpe_like": PRODUCTION_HOLDOUT["metrics"]["sharpe_like"],
+            "bench_zero_rmse": PRODUCTION_HOLDOUT["benchmarks"]["zero_rmse"],
+            "bench_last_rmse": PRODUCTION_HOLDOUT["benchmarks"]["last_rmse"],
+            "selected_signal_threshold": PRODUCTION_HOLDOUT["threshold"],
+        }
+    ]
+)
+PRODUCTION_HOLDOUT_SUMMARY_DF.to_csv(ARTIFACT_DIR / "production_holdout_summary.csv", index=False)
+
+print("\nPRODUCTION_HOLDOUT_SUMMARY_DF")
+print(PRODUCTION_HOLDOUT_SUMMARY_DF)
+
+# %% [markdown]
+# ## Final summary tables
+
+# %%
+FINAL_SUMMARY_DF = pd.concat(
+    [
+        POST_CV_HOLDOUT_SUMMARY_DF.assign(evaluation_protocol="post_cv_best_model_on_holdout"),
+        PRODUCTION_HOLDOUT_SUMMARY_DF.assign(evaluation_protocol="full_refit_production_on_holdout"),
+    ],
+    axis=0,
+    ignore_index=True,
+)
+
+FINAL_SUMMARY_DF.to_csv(ARTIFACT_DIR / "final_summary.csv", index=False)
+
+print("\n" + "=" * 100)
+print("FINAL_SUMMARY_DF")
+print(FINAL_SUMMARY_DF)
+
+# %% [markdown]
+# ## Notes on interpretation
+#
+# - `rmse`, `mae`, `ic` evaluate the regression forecast of the fixed-horizon ETH return
+# - `dir_auc` evaluates ranking of positive vs negative future ETH returns
+# - `trade_auc` evaluates ranking of tradeable vs non-tradeable future moves, where
+#   tradeability means `abs(future return)` exceeds the round-trip-cost-aware threshold
+# - `coverage` is the fraction of timestamps where `abs(prediction) >= selected_threshold`
+# - `trade_rate` is the number of executed sequential non-overlapping trades divided by
+#   the number of timestamps in the evaluated split
+# - `gross_pnl` and `net_pnl` are sums of per-trade log-return PnL across the split
+#
+# The benchmark forecasts are:
+# - `zero-return`: predict 0 future return
+# - `last-return extrapolation`: predict current ETH 1-bar return times `horizon_bars`
+
+# %%
+print("Notebook build complete.")

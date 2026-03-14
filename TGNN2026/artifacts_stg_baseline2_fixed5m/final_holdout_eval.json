@@ -1,0 +1,31 @@
+{
+  "thr_trade": 0.6,
+  "thr_dir": 0.65,
+  "holdout_eval": {
+    "trade_auc": 0.5238768938394129,
+    "trade_pr_auc": 0.23500376995599587,
+    "trade_brier": 0.28676768151559967,
+    "dir_auc": 0.5189106667979908,
+    "ret_rmse": 0.23744590701668047,
+    "ret_mae": 0.18537846207618713,
+    "price_rmse": 614.938411550295,
+    "trade_f1": 0.26907073509015256,
+    "trade_balanced_accuracy": 0.5001654085062204,
+    "n_opportunities": 1282,
+    "n_signals": 112,
+    "n_trades": 62,
+    "trade_rate": 0.0483619344773791,
+    "signal_rate": 0.0873634945397816,
+    "fill_rate_given_signal": 0.5535714285714286,
+    "hit_rate": 0.4838709677419355,
+    "cum_net_log_pnl": 0.008009146429329034,
+    "mean_net_log_ret": 0.00012917978111821022,
+    "mean_gross_log_ret": 0.00032917978111821034,
+    "max_drawdown": -0.018148344397035415,
+    "sharpe_like": 0.31691231293360916,
+    "avg_holding_bars": 5.0,
+    "position_changes": 124,
+    "thr_trade": 0.6,
+    "thr_dir": 0.65
+  }
+}

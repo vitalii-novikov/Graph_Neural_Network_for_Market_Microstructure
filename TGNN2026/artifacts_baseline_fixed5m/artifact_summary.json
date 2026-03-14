@@ -1,0 +1,57 @@
+{
+  "device": "cpu",
+  "assets": [
+    "ADA",
+    "BTC",
+    "ETH"
+  ],
+  "target_asset": "ETH",
+  "panel_rows": 17104,
+  "usable_samples": 17039,
+  "bar_timedelta": "0 days 00:01:00",
+  "forecast_horizon_bars": 5,
+  "lookback_bars": 60,
+  "receptive_field_bars": 31,
+  "cost_assumption": {
+    "entry_long": "mid + spread/2",
+    "exit_long": "mid - spread/2",
+    "entry_short": "mid - spread/2",
+    "exit_short": "mid + spread/2",
+    "fee_bps_one_way": 1.0
+  },
+  "class_balance": {
+    "full_trade_ratio": 0.19795762662128058,
+    "holdout_trade_ratio": 0.19718309859154928
+  },
+  "production_thresholds": {
+    "thr_trade": 0.75,
+    "thr_dir": 0.55
+  },
+  "production_holdout_metrics": {
+    "trade_auc": 0.5782719723691946,
+    "trade_pr_auc": 0.2627810458991413,
+    "trade_brier": 0.22044069229642518,
+    "dir_auc": 0.5405620318389287,
+    "ret_rmse": 0.13035364784353703,
+    "ret_mae": 0.10146528482437134,
+    "price_rmse_secondary": 309.1894645682482,
+    "trade_f1": 0.12965964343598055,
+    "trade_bal_acc": 0.521895015316068,
+    "n_opportunities": 2556,
+    "n_signals": 101,
+    "n_trades": 58,
+    "signal_rate": 0.03951486697965571,
+    "trade_rate": 0.02269170579029734,
+    "fill_rate_given_signal": 0.5742574257425742,
+    "cum_net_log_pnl": -0.06263919001963224,
+    "mean_net_log_ret": -0.0010799860348212455,
+    "mean_gross_log_ret": -0.0008799860348212457,
+    "hit_rate": 0.3793103448275862,
+    "max_drawdown": -0.09134445149651968,
+    "sharpe_like": -0.9428664608079937,
+    "avg_holding_bars": 5.0,
+    "position_changes": 116,
+    "thr_trade": 0.75,
+    "thr_dir": 0.55
+  }
+}
