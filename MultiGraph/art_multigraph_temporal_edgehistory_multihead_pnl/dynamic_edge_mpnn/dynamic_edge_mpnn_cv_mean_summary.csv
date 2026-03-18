@@ -1,0 +1,2 @@
+operator,graph_operator,cv_mean_test_selection_score,cv_mean_test_scaled_soft_utility,cv_mean_test_dir_auc,cv_mean_test_trade_auc,cv_mean_test_rmse,cv_mean_test_ic,cv_mean_test_pnl_sum,cv_mean_test_pnl_per_trade,cv_mean_test_sharpe_like
+dynamic_edge_mpnn,dynamic_edge_mpnn,0.3051305346508566,0.018291796548877852,0.521524978367234,0.5251357923052065,0.003005098047191677,0.03834212012449934,-0.022926185409951907,-0.00016721759710095396,-0.7988389088768545
